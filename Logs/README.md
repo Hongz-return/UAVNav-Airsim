@@ -1,6 +1,6 @@
 # 实验数据目录
 
-`Logs` 只保存当前可直接使用的训练数据、评估数据和实验索引。迁移清单、原始传输包、重复副本和交付 ZIP 均不再放在这里。
+`Logs` 保存训练数据、评估数据和实验索引。
 
 ## 目录结构
 
@@ -28,7 +28,7 @@ Logs/
 
 训练记录的固定粒度是 `scene/method/seed/run_id`，评估记录在其后增加 `evaluation_id`。补跑实验位于 `Runs/_repeat` 和 `Results/_repeat`，不会被误算为新的正式种子。
 
-脚本生成的压缩包统一写到 `outputs/packages`，不会与可直接读取的训练、评估数据混放；目录不存在时由打包脚本自动创建。历史整理凭证和重复传输副本已移出项目，保存在同级备份目录 `D:\code\ZipFIle\UAV_Navigation_DRL_AirSim_Archive\2026-08-15_root_cleanup`，不属于活动实验数据，也不被训练、评估或论文目录工具读取。
+脚本生成的压缩包写到 `outputs/packages`。
 
 ## 场景名称
 
@@ -54,7 +54,7 @@ Logs/
 
 核心覆盖没有缺失，但保留了 5 个中断或已被后续运行替代的 ENV4 运行：这 5 个均没有最终模型，其中 2 个也没有最佳模型。它们只用于训练过程追溯，不承担当前核心覆盖或论文检查点来源。
 
-`tunnel_mixed/coordatt_ablation_noattn/seed_1` 是历史消融产物，包含配置与最终模型，但原始 `run.json` 不存在。它被明确记作“模型存在、运行清单缺失”，没有补造元数据。
+`tunnel_mixed/coordatt_ablation_noattn/seed_1` 是消融产物，含配置与最终模型，没有 `run.json`。
 
 ## 重建与验证
 

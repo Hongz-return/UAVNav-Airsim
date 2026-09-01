@@ -2,7 +2,7 @@
 
 固定口径版本：2026-07-30
 
-实验数据结构请参阅 [`Logs/README.md`](Logs/README.md)。本文件只记录实验协议和命令，不记录“正在运行”之类容易过时的信息。
+实验数据结构请参阅 [`Logs/README.md`](Logs/README.md)。
 
 ## 实验矩阵
 
@@ -16,8 +16,7 @@
 | `tunnel_activate` | 动态障碍隧道 | 200,000 steps |
 | `tunnel_mixed` | 动静混合隧道 | 200,000 steps |
 
-注意：早期文档曾把 `tunnel_obs` 写成 100,000 steps，但现有完整实验实际使用
-150,000 steps。后续统计、论文和复现实验统一按 150,000 steps 描述。
+`tunnel_obs` 每个 seed 的训练预算为 150,000 steps。
 
 ## 固定训练口径
 
@@ -69,8 +68,7 @@ seed `0 1 2`、每个任务 200,000 steps，并统一从新打包的
 该入口不会训练 `mamba`、`ma` 和 `transformer`；三者保留给另一台电脑，
 合并结果时必须保持相同的场景、步数、seed 和算法配置。
 
-不要为了补做单个实验重新启动完整矩阵，应同时限定 `--methods` 和
-`--seeds`，并使用新的 run id。
+补跑单个任务时同时指定 `--methods` 和 `--seeds`，并使用新的 run id。
 
 ## 一键评估
 
@@ -97,31 +95,28 @@ pixi run python -m scripts.evaluation.evaluate_completed_runs -n 100 --max-paral
 每个模型的结果写入 `Logs/EvaData/Results/<scene>/<method>/<seed>/<run_id>/eval_*`；
 批处理计划、日志和最终汇总写入 `Logs/EvaData/FormalBatches/<run_id>/`。
 
-当前启动器不会根据已有 `eval_100_best_*` 自动跳过任务。全部评估已经完成
-后不要无筛选地重跑；如果只是缺少批次汇总，使用：
+当前启动器不会根据已有 `eval_100_best_*` 自动跳过任务。若只缺少批次汇总：
 
 ```powershell
 pixi run python -m scripts.evaluation.rebuild_summary `
   Logs/EvaData/FormalBatches/<run_id>
 ```
 
-## 完成判定
+## 训练与评估产物
 
-训练完成不能只看 `plan.json`。至少需要同时存在：
+一次完整训练包含：
 
 1. `models/checkpoint_<target>_steps.zip`
 2. `models/model_sb3.zip`
 3. `models/best_model.zip`
-4. 对应训练日志的正常完成标记
+4. 训练日志
 
-100 轮评估完成至少需要：
+一次 100 轮评估包含：
 
 1. `eval_100_best_*` 目录
 2. `summary_metrics.json`
 3. `evaluation_manifest.json`
-4. 所属批处理完成时，`results.json` 中该任务没有失败
-
-`plan.json` 只表示任务曾被计划，不能证明训练或评估成功。
+4. 批处理完成后，`results.json` 中对应任务
 
 ## 重复实验口径
 

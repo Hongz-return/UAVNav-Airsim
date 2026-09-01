@@ -12,28 +12,20 @@
 
 ## 文档入口
 
-为避免把历史描述误当成当前状态，文档按以下职责划分：
+- [`RETRAINING.md`](RETRAINING.md)：实验口径、训练预算和一键命令
+- [`Logs/README.md`](Logs/README.md)：训练、评估、筛选与归档数据目录
+- [`scripts/README.md`](scripts/README.md)：脚本入口
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：模块职责、观测/动作数据流与训练→评估→筛选调用链
 
-1. [`RETRAINING.md`](RETRAINING.md)：固定实验口径、训练预算和一键命令。
-2. [`Logs/README.md`](Logs/README.md)：训练、评估、筛选与归档数据的统一目录结构。
-3. [`scripts/README.md`](scripts/README.md)：当前维护的脚本入口。
-4. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：模块职责、观测/动作数据流与
-   训练→评估→筛选的调用链。
+## 环境
 
-若文档与磁盘产物冲突，以 `run.json`、模型文件、评估 manifest 和批处理
-`results.json` 为准，不以旧聊天记录或 `plan.json` 作为完成证据。
-
-## 当前实验环境
-
-- Python 环境：仓库根目录的 Pixi 环境
+- Python：仓库根目录的 Pixi 环境
 - 仿真器：Cosys-AirSim，`Multirotor`
-- 训练与评估入口：`scripts/training/`、`scripts/evaluation/`、`scripts/selection/`
+- 训练与评估：`scripts/training/`、`scripts/evaluation/`、`scripts/selection/`
 - 配置：`configs/`
 - 训练数据：`Logs/TrainData/`
 - 评估数据：`Logs/EvaData/`
 - 可视化：TensorBoard
-
-当前代码不使用 SwanLab，也不应根据历史 SwanLab 说明判断实验状态。
 
 ## 常用命令
 
@@ -60,6 +52,4 @@ pixi run python -m unittest discover -s tests -t .
 ## 安装提示
 
 项目依赖 Cosys-AirSim、Gymnasium、Stable-Baselines3、PyTorch、TensorBoard
-等组件。推荐使用仓库中的 `pixi.toml` 和 `pixi.lock` 复现 Python 环境，
-不要再参考旧版 GUI、fixed-wing、SwanLab 或仓库内嵌 Stable-Baselines3
-的历史安装流程。
+等组件。使用仓库中的 `pixi.toml` 和 `pixi.lock` 复现 Python 环境。
