@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "description": "LSTM tunnel_mixed formal checkpoint candidates for artifact-complete seeds 0 and 1.",
+  "candidates": [
+    {"scene": "tunnel_mixed", "method": "lstm", "seed": 0, "checkpoint_type": "best", "step": 100000},
+    {"scene": "tunnel_mixed", "method": "lstm", "seed": 0, "checkpoint_type": "checkpoint", "step": 110000},
+    {"scene": "tunnel_mixed", "method": "lstm", "seed": 0, "checkpoint_type": "checkpoint", "step": 160000},
+    {"scene": "tunnel_mixed", "method": "lstm", "seed": 0, "checkpoint_type": "checkpoint", "step": 200000},
+
+    {"scene": "tunnel_mixed", "method": "lstm", "seed": 1, "checkpoint_type": "checkpoint", "step": 100000},
+    {"scene": "tunnel_mixed", "method": "lstm", "seed": 1, "checkpoint_type": "checkpoint", "step": 180000},
+    {"scene": "tunnel_mixed", "method": "lstm", "seed": 1, "checkpoint_type": "best", "step": 185000},
+    {"scene": "tunnel_mixed", "method": "lstm", "seed": 1, "checkpoint_type": "checkpoint", "step": 190000},
+    {"scene": "tunnel_mixed", "method": "lstm", "seed": 1, "checkpoint_type": "checkpoint", "step": 200000}
+  ]
+}
