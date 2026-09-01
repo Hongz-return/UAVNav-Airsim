@@ -63,23 +63,3 @@ pixi run python -m unittest discover -s tests -t .
 等组件。推荐使用仓库中的 `pixi.toml` 和 `pixi.lock` 复现 Python 环境，
 不要再参考旧版 GUI、fixed-wing、SwanLab 或仓库内嵌 Stable-Baselines3
 的历史安装流程。
-
-## 引用
-
-```bibtex
-@article{he2021explainable,
-  title={Explainable Deep Reinforcement Learning for UAV autonomous path planning},
-  author={He, Lei and Aouf, Nabil and Song, Bifeng},
-  journal={Aerospace Science and Technology},
-  volume={118},
-  pages={107052},
-  year={2021},
-  publisher={Elsevier}
-}
-
-@article{zhao2025mambasac,
-  title={基于选择性状态空间模型的长时序强化学习无人机隧道导航方法},
-  author={Zhao, Hongjian},
-  year={2025}
-}
-```
