@@ -1,55 +1,90 @@
-# UAV Navigation DRL for AirSim
+# UAVNav-Airsim
 
-本仓库用于在 Cosys-AirSim 隧道环境中训练和评估无人机深度强化学习策略。
-当前维护的算法均基于 SAC，包括：
+**Deep reinforcement learning for UAV visual obstacle avoidance in confined tunnels — Cosys-AirSim + Unreal Engine.**
 
-- `sac`：SAC + FrameStack4
-- `coordatt`：CoordAtt-SAC
-- `lstm`：LSTM-SAC
-- `mamba`：Mamba-SAC
-- `ma`：Mamba + CoordAtt SAC
-- `transformer`：Transformer-SAC
+面向隧道受限空间的无人机视觉避障：以单目深度图序列与机体状态为输入、三维速度指令为输出的端到端深度强化学习。仓库包含 MA-SAC 方法实现，以及 6 种 SAC 系算法在 4 类 UE4 隧道场景下的完整训练 / 评估 / 筛选流水线。
 
-## 文档入口
+![六种算法在动静混合障碍隧道中的同屏飞行对比](docs/figures/demo_env4.gif)
 
-- [`RETRAINING.md`](RETRAINING.md)：实验口径、训练预算和一键命令
-- [`Logs/README.md`](Logs/README.md)：训练、评估、筛选与归档数据目录
-- [`scripts/README.md`](scripts/README.md)：脚本入口
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：模块职责、观测/动作数据流与训练→评估→筛选调用链
+## 亮点
 
-## 环境
+- **MA-SAC**：CoordAtt 对深度特征做方向感知重标定 + Mamba 选择性状态空间模型对历史观测做选择性记忆，作为 Actor/Critic 的时序主干
+- 自建 **4 类 UE4 隧道场景**：常规 / 静态障碍 / 动态障碍 / 动静混合
+- **6 算法 × 3 随机种子 × 100 回合**标准化评估；多 AirSim 实例 RPC 并行训练、checkpoint 自动筛选、评估 manifest 归档
+- 论文《融合坐标注意力与选择性时序建模的无人机视觉避障方法》投稿《控制与决策》（EI 收录期刊），返修中
 
-- Python：仓库根目录的 Pixi 环境
-- 仿真器：Cosys-AirSim，`Multirotor`
-- 训练与评估：`scripts/training/`、`scripts/evaluation/`、`scripts/selection/`
-- 配置：`configs/`
-- 训练数据：`Logs/TrainData/`
-- 评估数据：`Logs/EvaData/`
-- 可视化：TensorBoard
+![四类 UE4 隧道仿真环境：常规 / 静态障碍 / 动态障碍 / 动静混合](docs/figures/environments.png)
 
-## 常用命令
+## 实验结果
 
-在 PowerShell 中从仓库根目录执行：
+### 成功回合俯视轨迹对比
 
-```powershell
-pixi run python -m scripts.training.train_parallel --scene tunnel --dry-run
-pixi run python -m scripts.evaluation.evaluate_completed_runs --dry-run
-tensorboard --logdir Logs/TrainData/Runs
+| ENV1 常规 | ENV3 动态 | ENV4 混合 |
+|---|---|---|
+| ![traj_env1](docs/figures/traj_env1.png) | ![traj_env3](docs/figures/traj_env3.png) | ![traj_env4](docs/figures/traj_env4.png) |
+
+### 训练曲线（回合回报，3 种子均值 ± 标准差）
+
+| ENV1 常规 | ENV4 混合 |
+|---|---|
+| ![curve_env1](docs/figures/curve_env1.png) | ![curve_env4](docs/figures/curve_env4.png) |
+
+## 方法概述
+
+- **问题建模**：隧道内重复截面与有限视场导致部分可观测，建模为 POMDP；观测为 60×90 深度图序列 + 无人机状态，动作为连续三维速度指令（前向速度 / 垂直速度 / 偏航角速度）
+- **策略网络**：CNN + CoordAtt 编码深度图 → Mamba 时序主干（Actor 与 Critic 共用结构）→ 连续动作分布
+- **训练机制**：面向不等长轨迹的序列化 SAC——特征缓存、掩码损失、分阶段梯度更新
+- **对比基线**：SAC(FrameStack4) / CoordAtt-SAC / LSTM-SAC / Transformer-SAC / Mamba-SAC
+
+![MA-SAC 与现有方法对比](docs/figures/method_overview.png)
+
+## 仓库结构
+
+```
+configs/      各算法与场景的训练配置
+gym_env/      Gymnasium 环境封装、网络结构、回放缓冲、wrappers
+scripts/      训练编排 / 评估 / checkpoint 筛选 / 分析 / 打包入口
+tests/        无仿真自检（仅依赖标准库）
+docs/         架构说明：模块职责与训练→评估→筛选调用链
+Logs/         训练与评估产物目录（见 Logs/README.md）
 ```
 
-正式运行前请阅读 [`RETRAINING.md`](RETRAINING.md)。
-
-## 无仿真自检
-
-`tests/` 下的用例只依赖标准库，不需要 AirSim、GPU 或实验数据，覆盖实验路径
-约定、并行训练计划与场景步数预算，以及各评估调度器与
-`scripts.evaluation.evaluate_single` 的命令行契约：
+## 快速开始
 
 ```powershell
+# Python 环境（pixi）
+pixi install
+
+# 训练（先 dry-run 看计划，确认后去掉 --dry-run）
+pixi run python -m scripts.training.train_parallel --scene tunnel --dry-run
+
+# 评估
+pixi run python -m scripts.evaluation.evaluate_completed_runs --dry-run
+
+# 训练曲线
+tensorboard --logdir Logs/TrainData/Runs
+
+# 无仿真自检（不需要 AirSim / GPU）
 pixi run python -m unittest discover -s tests -t .
 ```
 
-## 安装提示
+正式运行前请阅读 [`RETRAINING.md`](RETRAINING.md)：实验口径、训练预算与完成判定。
 
-项目依赖 Cosys-AirSim、Gymnasium、Stable-Baselines3、PyTorch、TensorBoard
-等组件。使用仓库中的 `pixi.toml` 和 `pixi.lock` 复现 Python 环境。
+## 文档
+
+- [`RETRAINING.md`](RETRAINING.md)：实验协议与一键命令
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：模块职责与数据流
+- [`scripts/README.md`](scripts/README.md)：脚本入口
+- [`Logs/README.md`](Logs/README.md)：产物目录约定
+
+## 引用
+
+```bibtex
+@article{zhao2025mambasac,
+  title={融合坐标注意力与选择性时序建模的无人机视觉避障方法},
+  author={王海涌 and 赵洪建 and 王孟琳 and 张丹 and 陆昱亨},
+  journal={控制与决策},
+  note={返修中},
+  year={2025}
+}
+```
