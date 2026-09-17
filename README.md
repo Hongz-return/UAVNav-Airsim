@@ -14,20 +14,6 @@
 
 ![四类 UE4 隧道仿真环境：常规 / 静态障碍 / 动态障碍 / 动静混合](docs/figures/environments.png)
 
-## 实验结果
-
-### 成功回合俯视轨迹对比
-
-| ENV1 常规 | ENV3 动态 | ENV4 混合 |
-|---|---|---|
-| ![traj_env1](docs/figures/traj_env1.png) | ![traj_env3](docs/figures/traj_env3.png) | ![traj_env4](docs/figures/traj_env4.png) |
-
-### 训练曲线（回合回报，3 种子均值 ± 标准差）
-
-| ENV1 常规 | ENV4 混合 |
-|---|---|
-| ![curve_env1](docs/figures/curve_env1.png) | ![curve_env4](docs/figures/curve_env4.png) |
-
 ## 方法概述
 
 - **问题建模**：隧道内重复截面与有限视场导致部分可观测，建模为 POMDP；观测为 60×90 深度图序列 + 无人机状态，动作为连续三维速度指令（前向速度 / 垂直速度 / 偏航角速度）
