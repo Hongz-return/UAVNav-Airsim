@@ -21,7 +21,9 @@
 - **训练机制**：面向不等长轨迹的序列化 SAC——特征缓存、掩码损失、分阶段梯度更新
 - **对比基线**：SAC(FrameStack4) / CoordAtt-SAC / LSTM-SAC / Transformer-SAC / Mamba-SAC
 
-![MA-SAC 与现有方法对比](docs/figures/method_overview.png)
+![MA-SAC 系统框架：环境观测 → CoordAtt 特征重标定 → Mamba 时序主干 → Actor/Critic](docs/figures/architecture.png)
+
+![MA-SAC 与现有方法对比](docs/figures/method_compare.png)
 
 ## 仓库结构
 
