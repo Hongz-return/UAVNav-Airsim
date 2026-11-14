@@ -183,6 +183,32 @@ class SequenceCNN(nn.Module):
                 return features_flat.view(B, T, -1)  # (B, T, output_dim)
 
 
+class NextDepthPredictor(nn.Module):
+    """Predict pooled next depth (or depth delta) from Actor context and action."""
+
+    def __init__(
+        self, context_dim: int, action_dim: int, out_h: int = 15,
+        out_w: int = 22, hidden: int = 256, target: str = "next_depth",
+    ):
+        super().__init__()
+        if target not in {"next_depth", "depth_delta"}:
+            raise ValueError(f"Unsupported auxiliary target: {target}")
+        self.out_h = out_h
+        self.out_w = out_w
+        self.net = nn.Sequential(
+            nn.Linear(context_dim + action_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, out_h * out_w),
+            nn.Sigmoid() if target == "next_depth" else nn.Tanh(),
+        )
+
+    def forward(self, context: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        prediction = self.net(torch.cat([context, actions], dim=-1))
+        return prediction.reshape(*context.shape[:-1], self.out_h, self.out_w)
+
+
 class MambaActor(nn.Module):
     """
     Actor network with Mamba for sequence processing.
@@ -456,7 +482,9 @@ class MambaActor(nn.Module):
 
         return combined
 
-    def forward_sequence_from_features(self, cnn_features: torch.Tensor, states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward_sequence_from_features(
+        self, cnn_features: torch.Tensor, states: torch.Tensor, return_context: bool = False,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Process sequence using pre-computed CNN features (for feature caching).
 
@@ -467,6 +495,7 @@ class MambaActor(nn.Module):
         Returns:
             mean: (B, T, action_dim)
             log_std: (B, T, action_dim)
+            context: (B, T, hidden_dim), only when return_context=True
         """
         combined = self._combine_features(cnn_features, states, is_sequence=True)
 
@@ -482,9 +511,13 @@ class MambaActor(nn.Module):
         log_std = self.log_std(features)
         log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
 
+        if return_context:
+            return mean.view(B, T, -1), log_std.view(B, T, -1), context
         return mean.view(B, T, -1), log_std.view(B, T, -1)
 
-    def action_log_prob_sequence_from_features(self, cnn_features: torch.Tensor, states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def action_log_prob_sequence_from_features(
+        self, cnn_features: torch.Tensor, states: torch.Tensor, return_context: bool = False,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Get actions and log probs using pre-computed CNN features.
 
@@ -495,8 +528,12 @@ class MambaActor(nn.Module):
         Returns:
             actions: (B, T, action_dim) - SCALED to actual action space
             log_probs: (B, T)
+            context: (B, T, hidden_dim), only when return_context=True
         """
-        mean, log_std = self.forward_sequence_from_features(cnn_features, states)
+        if return_context:
+            mean, log_std, context = self.forward_sequence_from_features(cnn_features, states, return_context=True)
+        else:
+            mean, log_std = self.forward_sequence_from_features(cnn_features, states)
         B, T, _ = mean.shape
 
         mean_flat = mean.view(B * T, -1)
@@ -508,6 +545,8 @@ class MambaActor(nn.Module):
 
         actions_scaled = self.scale_action(actions_flat)
 
+        if return_context:
+            return actions_scaled.view(B, T, -1), log_probs_flat.view(B, T), context
         return actions_scaled.view(B, T, -1), log_probs_flat.view(B, T)
 
     def forward_sequence(self, observations: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -949,6 +988,11 @@ class MambaSACPolicy(SACPolicy):
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         n_critics: int = 2,
         share_features_extractor: bool = False,
+        aux_weight: float = 0.0,
+        aux_target: str = "next_depth",
+        aux_out_h: int = 15,
+        aux_out_w: int = 22,
+        aux_hidden: int = 256,
     ):
         self.cnn_output_dim = cnn_output_dim
         self.cnn_attention = cnn_attention
@@ -967,6 +1011,11 @@ class MambaSACPolicy(SACPolicy):
         self.backend = backend
         self.transformer_heads = transformer_heads
         self.transformer_layers = transformer_layers
+        self.aux_weight = aux_weight
+        self.aux_target = aux_target
+        self.aux_out_h = aux_out_h
+        self.aux_out_w = aux_out_w
+        self.aux_hidden = aux_hidden
 
         super().__init__(
             observation_space,
@@ -1088,6 +1137,15 @@ class MambaSACPolicy(SACPolicy):
             actor_params = [p for p in self.actor.parameters() if p.requires_grad]
             print(f"    CNN update mode: critic_only (only Critic updates CNN)")
 
+        if self.aux_weight > 0:
+            self.aux_predictor = NextDepthPredictor(
+                self.mamba_hidden_dim, self.action_space.shape[0],
+                self.aux_out_h, self.aux_out_w, self.aux_hidden, self.aux_target,
+            )
+            actor_params += list(self.aux_predictor.parameters())
+            if self.cnn_update_mode == "critic_only":
+                print("    [Aux] Warning: critic_only freezes the CNN during the Actor auxiliary update")
+
         self.actor.optimizer = self.optimizer_class(
             actor_params,
             lr=lr_schedule(1),
@@ -1159,6 +1217,8 @@ class MambaSACPolicy(SACPolicy):
     def set_training_mode(self, mode: bool) -> None:
         self.actor.train(mode)
         self.critic.train(mode)
+        if self.aux_weight > 0:
+            self.aux_predictor.train(mode)
         self.training = mode
 
     def extract_cnn_features(self, observations: Dict[str, torch.Tensor], use_target: bool = False) -> torch.Tensor:

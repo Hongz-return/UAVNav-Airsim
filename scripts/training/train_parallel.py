@@ -35,6 +35,9 @@ METHOD_CONFIGS = {
     "mamba": Path("configs/config_mamba.ini"),
     "ma": Path("configs/config_mamba_coordatt.ini"),
     "transformer": Path("configs/config_transformer.ini"),
+    "ma_motion": Path("configs/config_ma_motion.ini"),
+    "ma_aux": Path("configs/config_ma_aux.ini"),
+    "ma_motion_aux": Path("configs/config_ma_motion_aux.ini"),
 }
 
 SCENES = {

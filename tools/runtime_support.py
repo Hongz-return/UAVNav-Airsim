@@ -156,7 +156,7 @@ def create_model(algo: str, env, cfg: ConfigParser, log_path: str, seed: int = 0
     use_mamba = use_mamba_backend(cfg)
     n_stack = get_frame_stack_count(cfg)
 
-    if perception_type == "depth_state":
+    if perception_type in {"depth_state", "depth_motion"}:
         policy_base = "MultiInputPolicy"
     else:
         policy_base = "MlpPolicy" if policy_name == "mlp" else "CnnPolicy"
@@ -165,7 +165,7 @@ def create_model(algo: str, env, cfg: ConfigParser, log_path: str, seed: int = 0
     net_arch = ast.literal_eval(cfg.get("options", "net_arch"))
     policy_kwargs = dict(activation_fn=activation_fn, net_arch=net_arch)
 
-    if perception_type == "depth_state" and not use_mamba and n_stack > 1:
+    if perception_type in {"depth_state", "depth_motion"} and not use_mamba and n_stack > 1:
         policy_kwargs["features_extractor_class"] = FrameStackedDictExtractor
         policy_kwargs["features_extractor_kwargs"] = {
             "cnn_output_dim": cfg.getint("vision", "cnn_output_dim", fallback=64),

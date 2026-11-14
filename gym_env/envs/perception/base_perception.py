@@ -44,6 +44,10 @@ class BasePerception(ABC):
         except (configparser.NoSectionError, configparser.NoOptionError):
             self.camera_id = "0"
 
+    def reset(self) -> None:
+        """Reset episode-local perception state."""
+        pass
+
     @abstractmethod
     def get_observation_space(self) -> spaces.Space:
         """

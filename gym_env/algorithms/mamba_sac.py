@@ -141,6 +141,30 @@ class MambaSAC(BaseAlgorithm):
             for key, value in state.items():
                 if torch.is_tensor(value):
                     state[key] = value.to(target_device)
+
+    def _compute_aux_loss(self, context: torch.Tensor, batch: Dict) -> torch.Tensor:
+        """Masked next-depth MSE; terminal fallback frames cannot supervise prediction."""
+        with torch.no_grad():
+            def pool_depth(observations):
+                images = observations['image']
+                # (B,T,C,H,W), or use the newest frame of (B,T,stack,C,H,W).
+                depth = images[:, :, -1, 0] if self.policy.actor.n_stack > 1 else images[:, :, 0]
+                B, T, H, W = depth.shape
+                pooled = F.adaptive_avg_pool2d(
+                    depth.reshape(B * T, 1, H, W).float() / 255.0,
+                    (self.policy.aux_out_h, self.policy.aux_out_w),
+                )
+                return pooled.reshape(B, T, self.policy.aux_out_h, self.policy.aux_out_w)
+
+            target = pool_depth(batch['next_observations'])
+            if self.policy.aux_target == 'depth_delta':
+                target = target - pool_depth(batch['observations'])
+            actions = self.policy.actor.unscale_action(batch['actions']).detach()
+            aux_mask = batch['mask'] * (1 - batch['dones'])
+
+        prediction = self.policy.aux_predictor(context, actions)
+        mse_per_step = (prediction - target).pow(2).mean(dim=(-2, -1))
+        return (aux_mask * mse_per_step).sum() / aux_mask.sum().clamp(min=1.0)
     
     def train(self, gradient_steps: int, batch_size: int) -> None:
         """
@@ -162,6 +186,8 @@ class MambaSAC(BaseAlgorithm):
         actor_losses = []
         critic_losses = []
         ent_coef_losses = []
+        aux_losses = []
+        use_aux = self.policy.aux_weight > 0
         
         # Enhanced diagnostics
         q_values_list = []
@@ -278,12 +304,20 @@ class MambaSAC(BaseAlgorithm):
             else:
                 # cnn_update_mode == "both": Actor also updates CNN
                 # Compute features WITH gradient for CNN update
+                if use_aux:
+                    # Critic._cnn aliases shared_cnn; restore CNN gradients for aux-enabled runs.
+                    self.policy.shared_cnn.requires_grad_(True)
                 obs_features_cached = self.policy.extract_cnn_features(obs, use_target=False)
             
             # Actor samples new actions using cached features
-            actions_pi, log_probs = self.policy.actor.action_log_prob_sequence_from_features(
-                obs_features_cached, obs['state']
-            )
+            if use_aux:
+                actions_pi, log_probs, context = self.policy.actor.action_log_prob_sequence_from_features(
+                    obs_features_cached, obs['state'], return_context=True
+                )
+            else:
+                actions_pi, log_probs = self.policy.actor.action_log_prob_sequence_from_features(
+                    obs_features_cached, obs['state']
+                )
             # Clip log_probs to prevent extreme values
             log_probs = log_probs.clamp(-20, 20)
             
@@ -294,6 +328,10 @@ class MambaSAC(BaseAlgorithm):
             min_q_pi = torch.min(q1_pi, q2_pi).clamp(-300, 300)
             
             actor_loss = (mask * (ent_coef * log_probs - min_q_pi)).sum() / mask_sum
+            if use_aux:
+                aux_loss = self._compute_aux_loss(context, batch)
+                actor_loss = actor_loss + self.policy.aux_weight * aux_loss
+                aux_losses.append(aux_loss.item())
             
             self.policy.actor.optimizer.zero_grad()
             actor_loss.backward()
@@ -303,6 +341,8 @@ class MambaSAC(BaseAlgorithm):
                 actor_params = list(self.policy.actor.parameters()) + list(self.policy.shared_cnn.parameters())
             else:
                 actor_params = list(self.policy.actor.parameters())
+            if use_aux:
+                actor_params += list(self.policy.aux_predictor.parameters())
             actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor_params, 1.0)
             self.policy.actor.optimizer.step()
             actor_losses.append(actor_loss.item())
@@ -351,6 +391,8 @@ class MambaSAC(BaseAlgorithm):
             critic_grad_norms=critic_grad_norms,
             mask_sums=mask_sums,
         )
+        if aux_losses:
+            self.logger.record('train/aux_loss', np.mean(aux_losses))
 
     def learn(
         self,

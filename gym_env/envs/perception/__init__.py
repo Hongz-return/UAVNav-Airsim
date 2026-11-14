@@ -2,11 +2,13 @@
 
 from .base_perception import BasePerception
 from .depth_state_perception import DepthStatePerception
+from .depth_motion_perception import DepthMotionPerception
 from .vector_perception import VectorPerception
 
 # Registry for easy lookup by name
 PERCEPTION_REGISTRY = {
     'depth_state': DepthStatePerception,
+    'depth_motion': DepthMotionPerception,
     'vector': VectorPerception,
 }
 

@@ -62,7 +62,7 @@ class AirsimGymEnv(gym.Env):
 
         perception_cls = get_perception(self.perception_type)
         self.perception = perception_cls(cfg, self.client)
-        if self.perception_type in ["vector", "depth_state"]:
+        if self.perception_type in ["vector", "depth_state", "depth_motion"]:
             self.perception.set_state_feature_length(self.state_feature_length)
         self.observation_space = self.perception.get_observation_space()
         obs_desc = getattr(self.observation_space, "shape", self.observation_space)
@@ -117,6 +117,7 @@ class AirsimGymEnv(gym.Env):
         if self.task:
             self.task.reset()
 
+        self.perception.reset()
         obs = self._get_obs()
         return obs, {
             "scenario_id": (
