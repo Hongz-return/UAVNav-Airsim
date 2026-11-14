@@ -263,6 +263,59 @@ class Ch4PolicySmokeTest(unittest.TestCase):
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in frozen.policy.aux_predictor.parameters()))
         self.assertTrue(all(p.grad is None for p in frozen.policy.shared_cnn.parameters()))
 
+    def test_zero_aux_loss_preserves_sac_initialization_and_updates(self):
+        baseline = make_model(read_config('ma'))
+        auxiliary = make_model(read_config('ma_aux'))
+        for model in (baseline, auxiliary):
+            self.addCleanup(model.env.close)
+            fill_replay(model)
+        for key, tensor in baseline.policy.state_dict().items():
+            self.assertTrue(torch.equal(tensor, auxiliary.policy.state_dict()[key]), key)
+
+        compute_aux = auxiliary._compute_aux_loss
+        with patch.object(auxiliary, '_compute_aux_loss', side_effect=lambda context, batch: compute_aux(context, batch) * 0):
+            for model in (baseline, auxiliary):
+                torch.manual_seed(19)
+                np.random.seed(19)
+                model.train(gradient_steps=2, batch_size=4)
+        for key, tensor in baseline.policy.state_dict().items():
+            torch.testing.assert_close(tensor, auxiliary.policy.state_dict()[key], rtol=1e-6, atol=1e-8, msg=key)
+        for tensor, actual in zip(baseline.policy.shared_cnn.parameters(), auxiliary.policy.shared_cnn.parameters()):
+            self.assertTrue(torch.equal(tensor, actual))
+
+    def test_actor_cnn_gradient_is_aux_only_and_clipped_once(self):
+        model = make_model(read_config('ma_aux'))
+        self.addCleanup(model.env.close)
+        fill_replay(model)
+        batch = model.replay_buffer.sample(4)
+        auxiliary_ids = {id(p) for p in model.policy.aux_predictor.parameters()}
+        original_clip = torch.nn.utils.clip_grad_norm_
+        actor_updates = []
+
+        def check_and_clip(parameters, max_norm):
+            parameters = list(parameters)
+            if auxiliary_ids.intersection(id(p) for p in parameters):
+                actor_updates.append(True)
+                self.assertEqual(len(parameters), len({id(p) for p in parameters}))
+                # Independent aux-only forward at the same weights, before clipping or Adam.
+                features = model.policy.extract_cnn_features(batch['observations'])
+                _, _, context = model.policy.actor.forward_sequence_from_features(
+                    features, batch['observations']['state'], return_context=True,
+                )
+                loss = model.policy.aux_weight * model._compute_aux_loss(context, batch)
+                cnn_parameters = list(model.policy.shared_cnn.parameters())
+                expected = torch.autograd.grad(loss, cnn_parameters)
+                self.assertTrue(any(grad.abs().sum() > 0 for grad in expected))
+                for parameter, gradient in zip(cnn_parameters, expected):
+                    torch.testing.assert_close(parameter.grad, gradient)
+            return original_clip(parameters, max_norm)
+
+        with patch.object(model.replay_buffer, 'sample', return_value=batch), patch(
+            'torch.nn.utils.clip_grad_norm_', side_effect=check_and_clip,
+        ):
+            model.train(gradient_steps=1, batch_size=4)
+        self.assertEqual(len(actor_updates), 1)
+
     def test_create_model_uses_aux_config(self):
         for method in METHODS:
             with self.subTest(method=method), patch('tools.runtime_support.MambaSAC') as constructor:

@@ -294,6 +294,7 @@ class MambaSAC(BaseAlgorithm):
             
             # CNN gradient flow depends on cnn_update_mode
             cnn_update_mode = getattr(self.policy, 'cnn_update_mode', 'both')
+            aux_cnn_features = None
             if cnn_update_mode == "critic_only":
                 # Freeze shared CNN - it's updated by critic optimizer only
                 for param in self.policy.shared_cnn.parameters():
@@ -308,6 +309,10 @@ class MambaSAC(BaseAlgorithm):
                     # Critic._cnn aliases shared_cnn; restore CNN gradients for aux-enabled runs.
                     self.policy.shared_cnn.requires_grad_(True)
                 obs_features_cached = self.policy.extract_cnn_features(obs, use_target=False)
+                if use_aux:
+                    # Keep SAC's encoder stop-gradient; send only auxiliary gradients back to CNN.
+                    aux_cnn_features = obs_features_cached
+                    obs_features_cached = obs_features_cached.detach().requires_grad_(True)
             
             # Actor samples new actions using cached features
             if use_aux:
@@ -332,9 +337,15 @@ class MambaSAC(BaseAlgorithm):
                 aux_loss = self._compute_aux_loss(context, batch)
                 actor_loss = actor_loss + self.policy.aux_weight * aux_loss
                 aux_losses.append(aux_loss.item())
+                if aux_cnn_features is not None:
+                    aux_feature_grad, = torch.autograd.grad(
+                        self.policy.aux_weight * aux_loss, obs_features_cached, retain_graph=True,
+                    )
             
             self.policy.actor.optimizer.zero_grad()
             actor_loss.backward()
+            if aux_cnn_features is not None:
+                aux_cnn_features.backward(aux_feature_grad)
             
             # Gradient clipping: include CNN if Actor updates it
             if cnn_update_mode == "both":
@@ -343,6 +354,8 @@ class MambaSAC(BaseAlgorithm):
                 actor_params = list(self.policy.actor.parameters())
             if use_aux:
                 actor_params += list(self.policy.aux_predictor.parameters())
+                # Actor._cnn already owns these parameters; clip each gradient only once.
+                actor_params = list({id(p): p for p in actor_params}.values())
             actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor_params, 1.0)
             self.policy.actor.optimizer.step()
             actor_losses.append(actor_loss.item())

@@ -1137,21 +1137,6 @@ class MambaSACPolicy(SACPolicy):
             actor_params = [p for p in self.actor.parameters() if p.requires_grad]
             print(f"    CNN update mode: critic_only (only Critic updates CNN)")
 
-        if self.aux_weight > 0:
-            self.aux_predictor = NextDepthPredictor(
-                self.mamba_hidden_dim, self.action_space.shape[0],
-                self.aux_out_h, self.aux_out_w, self.aux_hidden, self.aux_target,
-            )
-            actor_params += list(self.aux_predictor.parameters())
-            if self.cnn_update_mode == "critic_only":
-                print("    [Aux] Warning: critic_only freezes the CNN during the Actor auxiliary update")
-
-        self.actor.optimizer = self.optimizer_class(
-            actor_params,
-            lr=lr_schedule(1),
-            **self.optimizer_kwargs,
-        )
-
         # Critic
         print(f"    Critic: {backend_name}(hidden={self.mamba_hidden_dim}) -> MLP{self.critic_hidden}")
         self.critic = MambaCritic(
@@ -1203,6 +1188,22 @@ class MambaSACPolicy(SACPolicy):
 
         self.critic.optimizer = self.optimizer_class(
             critic_params,
+            lr=lr_schedule(1),
+            **self.optimizer_kwargs,
+        )
+
+        # Build the optional head last so it cannot change seeded SAC initialization.
+        if self.aux_weight > 0:
+            self.aux_predictor = NextDepthPredictor(
+                self.mamba_hidden_dim, self.action_space.shape[0],
+                self.aux_out_h, self.aux_out_w, self.aux_hidden, self.aux_target,
+            )
+            actor_params += list(self.aux_predictor.parameters())
+            if self.cnn_update_mode == "critic_only":
+                print("    [Aux] Warning: critic_only freezes the CNN during the Actor auxiliary update")
+
+        self.actor.optimizer = self.optimizer_class(
+            actor_params,
             lr=lr_schedule(1),
             **self.optimizer_kwargs,
         )
