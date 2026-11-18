@@ -65,6 +65,26 @@ class DepthMotionPerceptionTest(unittest.TestCase):
             perception.reset()
             np.testing.assert_array_equal(perception.get_observation()['image'][..., 1], 128)
 
+    def test_camera_warms_once_before_depth_and_failures_are_reported(self):
+        client = Mock()
+        scene = SimpleNamespace(width=1, height=1, image_data_uint8=b'image')
+        depth = SimpleNamespace(width=5, height=3, image_data_float=[4.0] * 15)
+        client.simGetImages.side_effect = [[scene, scene], [depth], [depth]]
+        perception = DepthStatePerception(make_config(), client)
+        with patch('gym_env.envs.perception.depth_state_perception.time.sleep'):
+            np.testing.assert_array_equal(perception._get_depth(), np.full((3, 5), 4))
+            np.testing.assert_array_equal(perception._get_depth(), np.full((3, 5), 4))
+        self.assertEqual(client.simGetImages.call_count, 3)
+        failed_client = Mock()
+        failed_client.simGetImages.return_value = []
+        failed = DepthStatePerception(make_config(), failed_client)
+        with self.assertRaisesRegex(RuntimeError, 'warm up'):
+            failed._get_depth()
+        failed_client.simGetImages.side_effect = [[scene, scene]] + [[]] * 10
+        with patch('gym_env.envs.perception.depth_state_perception.time.sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'depth image'):
+                failed._get_depth()
+
     def test_depth_channel_and_obstacle_distance_match_depth_state(self):
         legacy = self.make_perception(cls=DepthStatePerception)
         motion = self.make_perception()

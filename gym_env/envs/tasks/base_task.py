@@ -34,6 +34,7 @@ class BaseTask(ABC):
         # For action smoothness penalty (shared across all tasks)
         self._prev_action = None
         self._action_delta_scale = None
+        self.last_reward_components = {}
         self._load_config(cfg)
 
     def _load_config(self, cfg: ConfigParser):
@@ -97,6 +98,8 @@ class BaseTask(ABC):
         Terminal rewards are read from ``[reward]``.
         """
         reward = 0.0
+        components = dict(progress=0.0, obstacle=0.0, time=0.0, smoothness=0.0,
+                          clipping=0.0, terminal=0.0, timeout=0.0)
 
         if not done:
             distance_now = self.get_distance_to_goal_3d()
@@ -107,13 +110,15 @@ class BaseTask(ABC):
             obstacle_penalty = self._compute_obstacle_penalty(self.env.min_distance_to_obstacles)
             smooth_penalty = self._compute_smoothness_penalty(action)
 
-            reward = (
-                r_progress
-                - self.obstacle_penalty_weight * obstacle_penalty
-                - self.time_penalty
-                - self.smoothness_weight * smooth_penalty
+            components.update(
+                progress=float(r_progress),
+                obstacle=float(-self.obstacle_penalty_weight * obstacle_penalty),
+                time=float(-self.time_penalty),
+                smoothness=float(-self.smoothness_weight * smooth_penalty),
             )
-            reward = np.clip(reward, -self.dense_reward_clip, self.dense_reward_clip)
+            dense_reward = sum(components.values())
+            reward = float(np.clip(dense_reward, -self.dense_reward_clip, self.dense_reward_clip))
+            components['clipping'] = reward - dense_reward
 
         else:
             if self._cached_success:
@@ -122,7 +127,9 @@ class BaseTask(ABC):
                 reward = self.r_fail_crash
             elif self._cached_outside:
                 reward = self.r_fail_outside
+            components['terminal'] = float(reward)
 
+        self.last_reward_components = components
         return reward
 
     def _compute_progress_reward(self, distance_delta: float) -> float:

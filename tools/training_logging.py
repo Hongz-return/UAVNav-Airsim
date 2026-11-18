@@ -109,6 +109,7 @@ class UAVLoggingCallback(BaseCallback):
         self.episode_lengths = []
         self.episode_successes = []
         self.episode_crashes = []
+        self.episode_reward_components = {}
         self.success_episode_steps = []
         self.success_episode_times = []
         self.last_success_episode_steps = None
@@ -185,6 +186,11 @@ class UAVLoggingCallback(BaseCallback):
             for idx, done in enumerate(self.locals["dones"]):
                 if done:
                     info = self.locals["infos"][idx]
+                    for name, value in info.get('episode_reward_components', {}).items():
+                        history = self.episode_reward_components.setdefault(name, [])
+                        history.append(float(value))
+                        self.logger.record(f'reward_component/{name}', float(value))
+                        self.logger.record(f'reward_component_ma20/{name}', np.mean(history[-20:]))
                     if "episode" in info:
                         episode_reward = float(info["episode"]["r"])
                         episode_length = int(info["episode"].get("l", info.get("step_num", 0)))

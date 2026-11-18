@@ -3,12 +3,13 @@ AirSim Gym environment for UAV navigation.
 """
 
 import ast
+import time
 
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from .dynamics.multirotor_airsim import MultirotorDynamicsAirsim
+from .dynamics.multirotor_airsim import MultirotorDynamicsAirsim, paused_state_reads
 from .perception import get_perception
 from .tasks import get_task
 
@@ -32,6 +33,7 @@ class AirsimGymEnv(gym.Env):
         self._evaluation_scenarios = None
         self._evaluation_scenario_index = 0
         self.current_scenario = None
+        self.record_evaluation_timing = False
 
     def set_config(self, cfg):
         """Configure environment from .ini config file."""
@@ -57,6 +59,7 @@ class AirsimGymEnv(gym.Env):
         self.dynamic_model = MultirotorDynamicsAirsim(cfg)
         self.client = self.dynamic_model.client
         self.state_feature_length = self.dynamic_model.state_feature_length
+        self.action_space = self.dynamic_model.action_space
 
         self._load_environment_config(cfg)
 
@@ -76,12 +79,12 @@ class AirsimGymEnv(gym.Env):
         self.total_step = 0
         self.step_num = 0
         self.cumulated_episode_reward = 0
+        self._episode_reward_components = {}
         self.previous_distance_from_des_point = 0
         self.min_distance_to_obstacles = float("inf")
 
         self.max_episode_steps = cfg.getint("environment", "max_episode_steps")
         self.action_repeat = cfg.getint("multirotor", "action_repeat", fallback=1)
-        self.action_space = self.dynamic_model.action_space
 
         print(f"  Action repeat: {self.action_repeat} (each action lasts {self.action_repeat * self.dynamic_model.dt:.2f}s)")
 
@@ -111,6 +114,7 @@ class AirsimGymEnv(gym.Env):
         self.episode_num += 1
         self.step_num = 0
         self.cumulated_episode_reward = 0
+        self._episode_reward_components = {}
         self.dynamic_model.goal_distance = self.dynamic_model.get_distance_to_goal_3d()
         self.previous_distance_from_des_point = self.dynamic_model.goal_distance
 
@@ -119,6 +123,10 @@ class AirsimGymEnv(gym.Env):
 
         self.perception.reset()
         obs = self._get_obs()
+        if self.record_evaluation_timing:
+            self.dynamic_model.get_velocity()
+            self.episode_start_state_timestamp = self.dynamic_model.last_state_timestamp
+            self.episode_start_wall_time = time.perf_counter()
         return obs, {
             "scenario_id": (
                 self.current_scenario.get("scenario_id")
@@ -158,34 +166,29 @@ class AirsimGymEnv(gym.Env):
     def step(self, action):
         """Execute action, optionally with action_repeat for smoother control."""
         self.step_num += 1
-        if self.action_repeat <= 1:
+        reward_components = {}
+        reward = 0.0
+        repeats = max(1, self.action_repeat)
+        for substep in range(repeats):
             actual_action = self._execute_action(action)
-            obs = self._get_obs()
-            done = self.task.is_done()
-            reward = self.task.compute_reward(done, actual_action)
-            self.cumulated_episode_reward += reward
-            self.total_step += 1
-            info = self.task.get_info()
-        else:
-            total_reward = 0.0
-            actual_action = None
-            for _ in range(self.action_repeat):
-                actual_action = self._execute_action(action)
+            with paused_state_reads(self.dynamic_model):
                 obs = self._get_obs()
                 done = self.task.is_done()
-                reward = self.task.compute_reward(done, actual_action)
-                total_reward += reward
-                self.cumulated_episode_reward += reward
+                step_reward = self.task.compute_reward(done, actual_action)
+                for name, value in self.task.last_reward_components.items():
+                    reward_components[name] = reward_components.get(name, 0.0) + value
+                reward += step_reward
+                self.cumulated_episode_reward += step_reward
                 self.total_step += 1
                 info = self.task.get_info()
-                if done:
+                if done or substep + 1 == repeats:
+                    info["actual_action"] = actual_action
+                    info["position"] = list(self.dynamic_model.get_position())
+                    info["velocity"] = list(self.dynamic_model.get_velocity())
+                    info["velocity_world"] = list(self.dynamic_model.last_velocity_world)
+                    info["state_timestamp"] = self.dynamic_model.last_state_timestamp
+                    info["min_distance_to_obstacles"] = float(self.min_distance_to_obstacles)
                     break
-            reward = total_reward
-
-        info["actual_action"] = actual_action
-        info["position"] = list(self.dynamic_model.get_position())
-        info["velocity"] = list(self.dynamic_model.get_velocity())
-        info["min_distance_to_obstacles"] = float(self.min_distance_to_obstacles)
 
         terminated = done
         if self.continue_after_collision and info.get("is_crash", False):
@@ -203,11 +206,21 @@ class AirsimGymEnv(gym.Env):
                 reward += timeout_reward
                 self.cumulated_episode_reward += timeout_reward
                 info["timeout_reward"] = timeout_reward
+                reward_components['timeout'] = reward_components.get('timeout', 0.0) + timeout_reward
             info["TimeLimit.truncated"] = True
+
+        info['reward_components'] = reward_components
+        for name, value in reward_components.items():
+            self._episode_reward_components[name] = self._episode_reward_components.get(name, 0.0) + value
+        if terminated or truncated:
+            info['episode_reward_components'] = dict(self._episode_reward_components)
 
         if self.step_num % 10 == 0:
             self.client.simPrintLogMessage("Train: ", f"EP:{self.episode_num} Step:{self.step_num}")
             self.client.simPrintLogMessage("Reward: ", f"{reward:.3f} total:{self.cumulated_episode_reward:.3f}")
+
+        if self.record_evaluation_timing:
+            info['wall_monotonic_time'] = time.perf_counter()
 
         return obs, reward, terminated, truncated, info
 

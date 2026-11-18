@@ -103,19 +103,43 @@ def get_frame_stack_count(cfg: ConfigParser) -> int:
     return cfg.getint("options", "n_stack", fallback=1)
 
 
+class CheckpointMonitor(Monitor):
+    """Remember the draw that produced DummyVecEnv's automatic episode reset."""
+
+    reset_origin = None
+    pending_reset_origin = None
+
+    def reset(self, **kwargs):
+        origin = self.pending_reset_origin
+        if origin is not None:
+            # Override a seed queued by SB3 when constructing the resumed model.
+            kwargs['seed'] = origin['seed']
+            if origin['seed'] is None:
+                self.env.unwrapped.np_random.bit_generator.state = origin['rng']
+        seed = kwargs.get('seed')
+        start = self.env.unwrapped.np_random.bit_generator.state if seed is None else None
+        output = super().reset(**kwargs)
+        self.reset_origin = {'seed': seed, 'rng': start}
+        self.pending_reset_origin = None
+        return output
+
+
 def build_runtime_env(cfg: ConfigParser):
     """Create the gym env and apply the shared runtime wrappers used by train/eval."""
     env = gym.make("airsim-env-v0")
     env.unwrapped.set_config(cfg)
+    if cfg.has_option('scene', 'runtime_script'):
+        from gym_env.wrappers.sequence_scene import SequenceSceneWrapper
+        env = SequenceSceneWrapper(env, cfg)
 
     n_stack = get_frame_stack_count(cfg)
     if n_stack > 1:
-        env = DictFrameStack(env, n_stack=n_stack)
+        env = DictFrameStack(env, n_stack=n_stack, channels_first=use_mamba_backend(cfg))
         print(f"Frame stacking: {n_stack} frames")
     else:
         print("Frame stacking: disabled (n_stack=1)")
 
-    env = Monitor(env)
+    env = CheckpointMonitor(env) if use_mamba_backend(cfg) else Monitor(env)
     monitored_env = env
     env = DummyVecEnv([lambda e=monitored_env: e])
     env = VecTransposeImage(env)
@@ -198,6 +222,17 @@ def create_model(algo: str, env, cfg: ConfigParser, log_path: str, seed: int = 0
         print(f"  actor={mamba_policy_kwargs['actor_hidden']}, critic={mamba_policy_kwargs['critic_hidden']}")
         print(f"  cnn_update_mode={cnn_update_mode}")
 
+        risk_kwargs = {}
+        if mamba_policy_kwargs["aux_weight"] > 0 and mamba_policy_kwargs["aux_target"] == "terminal_risk":
+            rewards = tuple(cfg.getfloat("reward", f"reward_{name}")
+                            for name in ("crash", "outside"))
+            if len({*rewards, cfg.getfloat("reward", "reward_reach")}) != 3:
+                raise ValueError("Terminal risk labels require distinct crash, boundary and arrival rewards")
+            risk_kwargs = {
+                "failure_horizon": cfg.getint("aux", "failure_horizon", fallback=30),
+                "failure_rewards": rewards,
+            }
+
         return MambaSAC(
             policy=MambaSACPolicy,
             env=env,
@@ -210,10 +245,12 @@ def create_model(algo: str, env, cfg: ConfigParser, log_path: str, seed: int = 0
             gamma=cfg.getfloat("DRL", "gamma"),
             train_freq=cfg.getint("DRL", "train_freq"),
             gradient_steps=cfg.getint("DRL", "gradient_steps"),
+            critic_loss=cfg.get("DRL", "critic_loss", fallback="huber"),
             tensorboard_log=log_path,
             policy_kwargs=mamba_policy_kwargs,
             seed=seed,
             verbose=1,
+            **risk_kwargs,
         )
 
     per_cfg = get_per_config(cfg, total_timesteps)
@@ -241,39 +278,26 @@ def create_model(algo: str, env, cfg: ConfigParser, log_path: str, seed: int = 0
             "eps": per_cfg.get("eps", 1e-6),
         }
 
+        common_kwargs = dict(
+            policy_kwargs=policy_kwargs,
+            buffer_size=cfg.getint("DRL", "buffer_size"),
+            gamma=cfg.getfloat("DRL", "gamma"),
+            learning_starts=cfg.getint("DRL", "learning_starts"),
+            learning_rate=lr,
+            batch_size=cfg.getint("DRL", "batch_size"),
+            train_freq=(cfg.getint("DRL", "train_freq"), "step"),
+            gradient_steps=cfg.getint("DRL", "gradient_steps"),
+            tensorboard_log=log_path,
+            seed=seed,
+            verbose=1,
+        )
+
         if use_per:
             algo_class = SAC_PER if algo == "SAC" else TD3_PER
             print(f"PER enabled: alpha={buffer_kwargs['alpha']}, beta={buffer_kwargs['beta_start']}->{buffer_kwargs['beta_end']}")
-            common_kwargs = dict(
-                policy_kwargs=policy_kwargs,
-                buffer_size=cfg.getint("DRL", "buffer_size"),
-                gamma=cfg.getfloat("DRL", "gamma"),
-                learning_starts=cfg.getint("DRL", "learning_starts"),
-                learning_rate=lr,
-                batch_size=cfg.getint("DRL", "batch_size"),
-                train_freq=(cfg.getint("DRL", "train_freq"), "step"),
-                gradient_steps=cfg.getint("DRL", "gradient_steps"),
-                tensorboard_log=log_path,
-                seed=seed,
-                verbose=1,
-                replay_buffer_class=buffer_class,
-                replay_buffer_kwargs=buffer_kwargs,
-            )
+            common_kwargs.update(replay_buffer_class=buffer_class, replay_buffer_kwargs=buffer_kwargs)
         else:
             algo_class = SAC if algo == "SAC" else TD3
-            common_kwargs = dict(
-                policy_kwargs=policy_kwargs,
-                buffer_size=cfg.getint("DRL", "buffer_size"),
-                gamma=cfg.getfloat("DRL", "gamma"),
-                learning_starts=cfg.getint("DRL", "learning_starts"),
-                learning_rate=lr,
-                batch_size=cfg.getint("DRL", "batch_size"),
-                train_freq=(cfg.getint("DRL", "train_freq"), "step"),
-                gradient_steps=cfg.getint("DRL", "gradient_steps"),
-                tensorboard_log=log_path,
-                seed=seed,
-                verbose=1,
-            )
 
         return algo_class(policy_base, env, action_noise=action_noise, **common_kwargs)
 
@@ -294,12 +318,15 @@ def load_model(algo: str, model_file: str, env, cfg: Optional[ConfigParser] = No
                 env=env,
                 policy_kwargs=policy_kwargs,
                 load_buffer=False,
+                critic_loss=cfg.get("DRL", "critic_loss", fallback="huber"),
             )
 
-        return MambaSAC.load(
+        learning_rate = cfg.getfloat("DRL", "learning_rate")
+        model = MambaSAC.load(
             model_file,
             env=env,
             policy_kwargs=policy_kwargs,
+            learning_rate=learning_rate,
             seq_len=cfg.getint("mamba", "seq_len", fallback=16),
             buffer_size=cfg.getint("DRL", "buffer_size"),
             learning_starts=cfg.getint("DRL", "learning_starts"),
@@ -307,8 +334,18 @@ def load_model(algo: str, model_file: str, env, cfg: Optional[ConfigParser] = No
             gamma=cfg.getfloat("DRL", "gamma"),
             train_freq=cfg.getint("DRL", "train_freq"),
             gradient_steps=cfg.getint("DRL", "gradient_steps"),
+            critic_loss=cfg.get("DRL", "critic_loss", fallback="huber"),
             tensorboard_log=tensorboard_log,
         )
+        # Restoring optimizer state also restores its old parameter-group LR.
+        # Keep the moments and counters, then apply the requested training LR.
+        optimizers = [model.policy.actor.optimizer, model.policy.critic.optimizer,
+                      getattr(model, "ent_coef_optimizer", None)]
+        for optimizer in optimizers:
+            if optimizer is not None:
+                for group in optimizer.param_groups:
+                    group["lr"] = learning_rate
+        return model
 
     model_cls = get_standard_model_class(algo, cfg) if cfg else {"SAC": SAC, "TD3": TD3, "PPO": PPO}[algo]
     load_kwargs = {"env": env}
@@ -318,12 +355,17 @@ def load_model(algo: str, model_file: str, env, cfg: Optional[ConfigParser] = No
 
 
 class MambaCheckpointCallback(BaseCallback):
-    """Periodic weights-only checkpoint; the final run stores the resumable buffer."""
+    """Save lightweight checkpoints and a full checkpoint at episode boundaries."""
 
     def __init__(self, save_freq: int, save_path: str, verbose: int = 1):
         super().__init__(verbose)
         self.save_freq = save_freq
         self.save_path = save_path
+        self.full_save_freq = 20000
+        self.next_full_step = self.full_save_freq
+
+    def _on_training_start(self) -> None:
+        self.next_full_step = (self.num_timesteps // self.full_save_freq + 1) * self.full_save_freq
 
     def _on_step(self) -> bool:
         if self.n_calls % self.save_freq == 0:
@@ -331,6 +373,14 @@ class MambaCheckpointCallback(BaseCallback):
             self.model.save(path, include_buffer=False)
             if self.verbose > 0:
                 print(f"[Checkpoint] Saved weights-only checkpoint to {path}")
+        if self.num_timesteps >= self.next_full_step and np.any(self.locals.get('dones', False)):
+            temporary = os.path.join(self.save_path, 'latest_full_checkpoint.tmp')
+            final = os.path.join(self.save_path, 'latest_full_checkpoint.zip')
+            self.model.save_full_checkpoint(temporary)
+            os.replace(temporary + '.zip', final)
+            self.next_full_step = (self.num_timesteps // self.full_save_freq + 1) * self.full_save_freq
+            if self.verbose > 0:
+                print(f'[Checkpoint] Saved full checkpoint at episode boundary: {final}')
         return True
 
 

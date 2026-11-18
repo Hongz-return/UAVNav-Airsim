@@ -21,7 +21,7 @@ setuptools = "<81"
 gym-env = { path = ".", editable = true }
 stable-baselines3 = "==2.8.0"
 gymnasium = "==1.2.3"
-cosysairsim = "==3.3.0"
+cosysairsim = "==3.2.0"
 mambapy = "==1.2.0"
 opencv-python = ">=4.10"
 pyyaml = ">=6"

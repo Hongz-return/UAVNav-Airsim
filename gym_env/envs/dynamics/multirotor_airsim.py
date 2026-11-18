@@ -1,8 +1,11 @@
 """Multirotor dynamics using Cosys-AirSim."""
 
+from contextlib import contextmanager
+
 import cosysairsim as airsim
 import numpy as np
 import math
+import json
 import time
 from gymnasium import spaces
 
@@ -36,6 +39,21 @@ def quaternion_to_euler(q):
     return [roll, pitch, yaw]
 
 
+@contextmanager
+def paused_state_reads(dynamics):
+    """Share one render pose and one physics state within a paused control substep."""
+    if not dynamics.synchronous_steps:
+        yield
+        return
+    pose = dynamics.client.simGetVehiclePose(dynamics.vehicle_name)
+    state = dynamics.client.getMultirotorState(vehicle_name=dynamics.vehicle_name)
+    dynamics._paused_readings = (pose, state)
+    try:
+        yield
+    finally:
+        dynamics._paused_readings = None
+
+
 class MultirotorDynamicsAirsim:
     """Multirotor dynamics controller for Cosys-AirSim."""
 
@@ -48,6 +66,7 @@ class MultirotorDynamicsAirsim:
         self.airsim_ip = cfg.get('airsim', 'ip', fallback='')
         self.airsim_port = cfg.getint('airsim', 'rpc_port', fallback=41451)
         self.airsim_timeout = cfg.getfloat('airsim', 'timeout_value', fallback=3600.0)
+        self.synchronous_steps = cfg.getboolean('airsim', 'synchronous_steps', fallback=False)
 
         # AirSim client (shared if provided, else create new)
         if client is not None:
@@ -61,6 +80,11 @@ class MultirotorDynamicsAirsim:
             )
             self.client.confirmConnection()
             self._owns_client = True
+
+        if self.synchronous_steps:
+            settings = json.loads(self.client.getSettingsString())
+            if settings.get('ClockType') != 'SteppableClock':
+                raise ValueError('synchronous_steps requires AirSim ClockType=SteppableClock')
 
         self.client.enableApiControl(True, self.vehicle_name)
         self.client.armDisarm(True, self.vehicle_name)
@@ -108,10 +132,22 @@ class MultirotorDynamicsAirsim:
 
     def reset(self, rng=None):
         """Reset drone to start position and take off."""
+        if self.synchronous_steps:
+            self.client.simPause(True)
+        try:
+            self._reset_vehicle(rng)
+        finally:
+            if self.synchronous_steps:
+                self.client.simPause(True)
+
+    def _reset_vehicle(self, rng):
         # Only reset all if we own the client (single vehicle mode)
         if self._owns_client:
             self.client.reset()
-            time.sleep(0.1)
+
+        self.client.enableApiControl(True, self.vehicle_name)
+        if not self.client.armDisarm(True, self.vehicle_name):
+            raise RuntimeError("Failed to arm drone during episode reset")
 
         # Set pose for this vehicle
         random_source = rng if rng is not None else np.random
@@ -120,17 +156,54 @@ class MultirotorDynamicsAirsim:
             if self.start_fixed_yaw is not None
             else self.start_random_angle * random_source.random()
         )
+        if self.synchronous_steps:
+            state = airsim.KinematicsState()
+            state.position = airsim.Vector3r(*self.start_position)
+            state.orientation = to_quaternion(0, 0, yaw)
+            state.linear_velocity = state.angular_velocity = airsim.Vector3r()
+            state.linear_acceleration = state.angular_acceleration = airsim.Vector3r()
+            self.client.simSetKinematics(state, True, self.vehicle_name)
+            self._advance_synchronously(0, 0, 0, airsim.YawMode(True, 0), duration=1.0)
+            self._validate_reset_state(yaw)
+            return
+
         pose = self.client.simGetVehiclePose(self.vehicle_name)
         pose.position.x_val = self.start_position[0]
         pose.position.y_val = self.start_position[1]
         pose.position.z_val = self.start_position[2]
         pose.orientation = to_quaternion(0, 0, yaw)
         self.client.simSetVehiclePose(pose, True, self.vehicle_name)
+        # Spawn is already airborne; takeoff rejects a falling vehicle. Settle before observing.
+        settled = self.client.moveByVelocityAsync(
+            0, 0, 0, 1.0, vehicle_name=self.vehicle_name,
+        ).get()
+        if not settled:
+            raise RuntimeError("Failed to settle drone during episode reset")
 
-        time.sleep(0.05)
-        self.client.enableApiControl(True, self.vehicle_name)
-        self.client.armDisarm(True, self.vehicle_name)
-        self.client.takeoffAsync(vehicle_name=self.vehicle_name).join()
+    def _validate_reset_state(self, requested_yaw):
+        state = self.client.getMultirotorState(vehicle_name=self.vehicle_name)
+        kinematics = state.kinematics_estimated
+        position = list(kinematics.position)
+        velocity = list(kinematics.linear_velocity)
+        render_position = list(self.client.simGetVehiclePose(self.vehicle_name).position)
+        collision = self.client.simGetCollisionInfo(self.vehicle_name)
+        roll, pitch, yaw = quaternion_to_euler(kinematics.orientation)
+        yaw_error = (yaw - requested_yaw + math.pi) % (2 * math.pi) - math.pi
+        error = math.dist(position, self.start_position)
+        speed = float(np.linalg.norm(velocity))
+        self.last_reset_state = {
+            'requested_position_ned_m': list(self.start_position),
+            'position_ned_m': position, 'velocity_ned_mps': velocity,
+            'position_error_m': error, 'speed_mps': speed,
+            'render_position_ned_m': render_position,
+            'render_physics_difference_m': math.dist(position, render_position),
+            'attitude_rad': [roll, pitch, yaw], 'yaw_error_rad': yaw_error,
+            'collision': bool(state.collision.has_collided or collision.has_collided),
+        }
+        if (not all(math.isfinite(v) for v in position + velocity + render_position + [roll, pitch, yaw])
+                or error > 0.2 or speed > 0.15 or max(abs(roll), abs(pitch), abs(yaw_error)) > 0.05
+                or math.dist(position, render_position) > 0.05 or self.last_reset_state['collision']):
+            raise RuntimeError('Invalid airborne reset state: ' + json.dumps(self.last_reset_state))
 
     def set_action(self, action):
         """Execute velocity command."""
@@ -145,17 +218,59 @@ class MultirotorDynamicsAirsim:
         vy = v_forward * math.sin(yaw)
         vz = -v_z  # NED convention
 
-        self.client.moveByVelocityAsync(
-            vx, vy, vz, self.dt,
-            drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
-            yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=math.degrees(yaw_rate)),
-            vehicle_name=self.vehicle_name,
-        ).join()
+        yaw_mode = airsim.YawMode(is_rate=True, yaw_or_rate=math.degrees(yaw_rate))
+        if self.synchronous_steps:
+            self._advance_synchronously(vx, vy, vz, yaw_mode)
+        else:
+            completed = self.client.moveByVelocityAsync(
+                vx, vy, vz, self.dt,
+                drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
+                yaw_mode=yaw_mode,
+                vehicle_name=self.vehicle_name,
+            ).get()
+            if not completed:
+                raise RuntimeError("Failed to execute drone velocity command")
 
         # Store for state computation
         self.v_xy_sp = v_forward
         self.v_z_sp = v_z
         self.yaw_sp = yaw + yaw_rate * self.dt
+
+    def _advance_synchronously(self, vx, vy, vz, yaw_mode, duration=None):
+        # Keep the command alive across each physics window; paused inference must not trigger SimpleFlight's 60ms timeout.
+        before = self.client.getMultirotorState(vehicle_name=self.vehicle_name).timestamp
+        started = time.monotonic()
+        control_duration = self.dt if duration is None else duration
+        future = self.client.moveByVelocityAsync(
+            vx, vy, vz, control_duration + 1.0,
+            drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
+            yaw_mode=yaw_mode, vehicle_name=self.vehicle_name,
+        )
+        advanced = 0.0
+        scene_step = getattr(self, 'scene_step_callback', None)
+        last_progress = time.monotonic()
+        try:
+            while advanced < control_duration - 1e-6:
+                if time.monotonic() - last_progress > 5.0:
+                    raise TimeoutError('Synchronous AirSim physics did not advance')
+                previous_advance = advanced
+                window = control_duration - advanced
+                if scene_step is not None:
+                    window = min(window, 0.05)
+                self.client.simContinueForTime(max(0.002, window))
+                timestamp = self.client.getMultirotorState(vehicle_name=self.vehicle_name).timestamp
+                advanced = (timestamp - before) / 1e9
+                if scene_step is not None:
+                    scene_step(timestamp)
+                if advanced > previous_advance:
+                    last_progress = time.monotonic()
+        finally:
+            self.client.simPause(True)
+            self.client.cancelLastTask(self.vehicle_name)
+            # False is expected after cancellation; get() still propagates RPC errors.
+            future.get()
+        self.last_control_sim_seconds = advanced
+        self.last_control_wall_seconds = time.monotonic() - started
 
     def set_start(self, position, random_angle, fixed_yaw=None):
         """Set start position and random angle range."""
@@ -181,14 +296,17 @@ class MultirotorDynamicsAirsim:
 
     def get_position(self):
         """Get current position [x, y, z] in ENU frame."""
-        p = self.client.simGetVehiclePose(self.vehicle_name).position
+        p = self._vehicle_pose().position
         return [p.x_val, p.y_val, -p.z_val]
 
     def get_velocity(self):
         """Get current body-frame velocity [v_forward, v_up, yaw_rate]."""
-        state = self.client.getMultirotorState(vehicle_name=self.vehicle_name)
+        readings = getattr(self, "_paused_readings", None)
+        state = readings[1] if readings is not None else self.client.getMultirotorState(vehicle_name=self.vehicle_name)
         lv = state.kinematics_estimated.linear_velocity
         av = state.kinematics_estimated.angular_velocity
+        self.last_state_timestamp = int(state.timestamp)
+        self.last_velocity_world = [float(lv.x_val), float(lv.y_val), -float(lv.z_val)]
 
         # World/NED velocities
         vx, vy, vz = lv.x_val, lv.y_val, lv.z_val
@@ -200,9 +318,13 @@ class MultirotorDynamicsAirsim:
         yaw_rate = av.z_val
         return [v_forward, v_up, yaw_rate]
 
+    def _vehicle_pose(self):
+        readings = getattr(self, "_paused_readings", None)
+        return readings[0] if readings is not None else self.client.simGetVehiclePose(self.vehicle_name)
+
     def get_attitude(self):
         """Get current attitude [roll, pitch, yaw] in radians."""
-        q = self.client.simGetVehiclePose(self.vehicle_name).orientation
+        q = self._vehicle_pose().orientation
         return quaternion_to_euler(q)
 
     def get_attitude_cmd(self):

@@ -1,7 +1,8 @@
 """Depth image + state vector perception (Dict observation)."""
 
+import time
+
 import numpy as np
-import cv2
 import cosysairsim as airsim
 from gymnasium import spaces
 
@@ -15,10 +16,13 @@ class DepthStatePerception(BasePerception):
       - state: normalized state vector float32 (0-1)
     """
 
+    image_channels = 1
+
     def __init__(self, cfg, client):
         super().__init__(cfg, client)
         # Will be set from dynamic model
         self.state_feature_length = 0
+        self._camera_warmed = False
 
     def set_state_feature_length(self, length: int):
         """Set state feature length from dynamic model."""
@@ -26,55 +30,53 @@ class DepthStatePerception(BasePerception):
 
     def get_observation_space(self) -> spaces.Space:
         """Return observation space as Dict(image, state)."""
-        image_shape = (self.screen_height, self.screen_width, 1)
         return spaces.Dict({
-            "image": spaces.Box(
-                low=np.zeros(image_shape, dtype=np.uint8),
-                high=np.full(image_shape, 255, dtype=np.uint8),
-                dtype=np.uint8
-            ),
-            "state": spaces.Box(
-                low=np.zeros((self.state_feature_length,), dtype=np.float32),
-                high=np.ones((self.state_feature_length,), dtype=np.float32),
-                dtype=np.float32
-            ),
+            "image": spaces.Box(0, 255, (self.screen_height, self.screen_width, self.image_channels), np.uint8),
+            "state": spaces.Box(0, 1, (self.state_feature_length,), np.float32),
         })
 
     def get_observation(self, state_feature: np.ndarray = None) -> dict:
-        """Get depth image (uint8) and normalized state vector."""
         depth_meter = self._get_depth()
-        depth_resized = self.resize_image(depth_meter)
-        depth_uint8 = self.preprocess_depth(depth_resized)
+        depth_uint8 = self.preprocess_depth(self.resize_image(depth_meter))
+        image = self._image_channels(depth_meter, depth_uint8)
+        if state_feature is None:
+            state = np.zeros(self.state_feature_length, dtype=np.float32)
+        else:
+            state = np.asarray(state_feature, dtype=np.float32)[:self.state_feature_length]
+            state = np.clip(state, 0.0, 1.0)
+        return {"image": image, "state": state}
 
-        # HWC -> (H, W, 1)
-        depth_ch = np.expand_dims(depth_uint8, axis=-1)
-
-        # State is already normalized to [0, 1] from dynamics model
-        state_norm = np.zeros((self.state_feature_length,), dtype=np.float32)
-        if state_feature is not None:
-            state_norm = np.asarray(state_feature, dtype=np.float32)
-            state_norm = np.clip(state_norm[:self.state_feature_length], 0.0, 1.0)
-
-        return {
-            "image": depth_ch,
-            "state": state_norm,
-        }
+    def _image_channels(self, depth_meter, depth_uint8):
+        return depth_uint8[..., None]
 
     def _get_depth(self):
         """Fetch depth (meters) from AirSim using DepthPlanar."""
         max_retries = 10
+        if not self._camera_warmed:
+            # A valid-sized first depth frame can contain uninitialized render values.
+            for _ in range(max_retries):
+                warmed = self.client.simGetImages([
+                    airsim.ImageRequest(self.camera_id, airsim.ImageType.Scene, False, True),
+                    airsim.ImageRequest(self.camera_id, airsim.ImageType.DepthPlanar, False, True),
+                ])
+                if len(warmed) == 2 and all(
+                    image.width > 0 and image.height > 0 and len(image.image_data_uint8) > 0
+                    for image in warmed
+                ):
+                    time.sleep(0.25)
+                    self._camera_warmed = True
+                    break
+            else:
+                raise RuntimeError("Failed to warm up the AirSim camera")
         for attempt in range(max_retries):
             responses = self.client.simGetImages([
                 airsim.ImageRequest(self.camera_id, airsim.ImageType.DepthPlanar, True)
             ])
-            if responses[0].width > 0:
+            if responses and responses[0].width > 0 and responses[0].height > 0:
                 break
             print(f"get_image_fail... retry {attempt + 1}/{max_retries}")
         else:
-            # Return fallback depth (max range) if all retries fail
-            print("WARNING: Failed to get depth image, using fallback")
-            return np.full((self.screen_height, self.screen_width),
-                          self.max_depth_meters, dtype=np.float32)
+            raise RuntimeError("Failed to get a depth image from AirSim")
 
         depth_img = airsim.list_to_2d_float_array(
             responses[0].image_data_float,

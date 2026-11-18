@@ -157,30 +157,13 @@ class SequenceCNN(nn.Module):
         Returns:
             features: (B, T, output_dim) or (B, output_dim)
         """
-        if self.n_stack == 1:
-            # No frame stacking case
-            if images.dim() == 4:
-                # Single step: (B, C, H, W)
-                return self.fc(self._forward_cnn(images))  # (B, output_dim)
-            else:
-                # Sequence: (B, T, C, H, W)
-                B, T, C, H, W = images.shape
-                images_flat = images.view(B * T, C, H, W)
-                features_flat = self.fc(self._forward_cnn(images_flat))  # (B*T, output_dim)
-                return features_flat.view(B, T, -1)  # (B, T, output_dim)
-        else:
-            # Frame stacking case
-            if images.dim() == 5:
-                # Single step: (B, n_stack, C, H, W)
-                B, n_stack, C, H, W = images.shape
-                images_flat = images.view(B, n_stack * C, H, W)
-                return self.fc(self._forward_cnn(images_flat))  # (B, output_dim)
-            else:
-                # Sequence: (B, T, n_stack, C, H, W)
-                B, T, n_stack, C, H, W = images.shape
-                images_flat = images.view(B * T, n_stack * C, H, W)
-                features_flat = self.fc(self._forward_cnn(images_flat))  # (B*T, output_dim)
-                return features_flat.view(B, T, -1)  # (B, T, output_dim)
+        # Fold the optional stack into channels, preserving batch/time axes.
+        frame_dims = 4 if self.n_stack > 1 else 3
+        leading = images.shape[:-frame_dims]
+        channels, height, width = images.shape[-3:]
+        flat = images.reshape(-1, self.n_stack * channels, height, width)
+        features = self.fc(self._forward_cnn(flat))
+        return features.reshape(*leading, features.shape[-1])
 
 
 class NextDepthPredictor(nn.Module):
@@ -209,7 +192,24 @@ class NextDepthPredictor(nn.Module):
         return prediction.reshape(*context.shape[:-1], self.out_h, self.out_w)
 
 
-class MambaActor(nn.Module):
+class _ObservationEncoder(nn.Module):
+    """Shared input layout for the actor and both critics."""
+
+    def set_cnn(self, cnn: SequenceCNN):
+        self._cnn = cnn
+
+    def _process_obs(self, observations: Dict[str, torch.Tensor], is_sequence: bool = False):
+        features = self._cnn(observations["image"].float() / 255.0)
+        return self._combine_features(features, observations["state"], is_sequence)
+
+    def _combine_features(self, cnn_features, states, is_sequence=False):
+        if self.n_stack > 1:
+            states = states[..., -1, :]
+        combined = self.input_norm(torch.cat([cnn_features, states.float()], dim=-1))
+        return combined if is_sequence else combined.unsqueeze(1)
+
+
+class MambaActor(_ObservationEncoder):
     """
     Actor network with Mamba for sequence processing.
     Supports both single-step inference and sequence-based training.
@@ -321,9 +321,6 @@ class MambaActor(nn.Module):
         self._history_buffer = None
         self._history_len = 0
 
-    def set_cnn(self, cnn: SequenceCNN):
-        self._cnn = cnn
-
     def reset_history(self):
         """Reset history buffer at episode start."""
         self._history_buffer = None
@@ -343,23 +340,9 @@ class MambaActor(nn.Module):
 
     def _init_history_buffer(self, obs: Dict[str, torch.Tensor]):
         """Initialize history buffer with first observation."""
-        # obs shapes depend on n_stack:
-        # n_stack > 1: {image: (B, n_stack, C, H, W), state: (B, n_stack, state_dim)}
-        # n_stack = 1: {image: (B, C, H, W), state: (B, state_dim)}
-        B = obs["image"].shape[0]
-        device = obs["image"].device
-
-        # Pre-allocate buffer for efficiency
-        if self.n_stack > 1:
-            img_shape = obs["image"].shape[1:]  # (n_stack, C, H, W)
-            state_shape = obs["state"].shape[1:]  # (n_stack, state_dim)
-        else:
-            img_shape = obs["image"].shape[1:]  # (C, H, W)
-            state_shape = obs["state"].shape[1:]  # (state_dim,)
-
         self._history_buffer = {
-            "image": torch.zeros(B, self.inference_seq_len, *img_shape, device=device, dtype=obs["image"].dtype),
-            "state": torch.zeros(B, self.inference_seq_len, *state_shape, device=device, dtype=obs["state"].dtype),
+            key: value.new_zeros((value.shape[0], self.inference_seq_len, *value.shape[1:]))
+            for key, value in obs.items()
         }
         self._history_len = 0
 
@@ -395,92 +378,6 @@ class MambaActor(nn.Module):
     def unscale_action(self, action: torch.Tensor) -> torch.Tensor:
         """Unscale action from actual action space to [-1, 1]."""
         return (action - self.action_bias) / self.action_scale
-
-    def _process_obs(self, observations: Dict[str, torch.Tensor], is_sequence: bool = False):
-        """
-        Process observations through CNN.
-
-        Args:
-            observations: Dict with 'image' and 'state'
-                - With n_stack > 1:
-                    - Single step: image (B, n_stack, C, H, W), state (B, n_stack, state_dim)
-                    - Sequence: image (B, T, n_stack, C, H, W), state (B, T, n_stack, state_dim)
-                - With n_stack = 1:
-                    - Single step: image (B, C, H, W), state (B, state_dim)
-                    - Sequence: image (B, T, C, H, W), state (B, T, state_dim)
-            is_sequence: whether input is a sequence
-
-        Returns:
-            combined: (B, 1, combined_dim) or (B, T, combined_dim)
-        """
-        images = observations["image"].float() / 255.0
-        states = observations["state"].float()
-
-        if is_sequence:
-            if self.n_stack > 1:
-                # (B, T, n_stack, C, H, W) -> (B, T, cnn_output_dim)
-                B, T, n_stack, C, H, W = images.shape
-                images_flat = images.reshape(B * T, n_stack, C, H, W)
-                cnn_features = self._cnn(images_flat)  # (B*T, cnn_output_dim)
-                cnn_features = cnn_features.view(B, T, -1)  # (B, T, cnn_output_dim)
-                # State: (B, T, n_stack, state_dim) -> take last of n_stack -> (B, T, state_dim)
-                states = states[:, :, -1, :]  # (B, T, state_dim)
-            else:
-                # (B, T, C, H, W) -> (B, T, cnn_output_dim)
-                cnn_features = self._cnn(images)  # (B, T, cnn_output_dim)
-                # State: (B, T, state_dim) - already correct shape
-
-            combined = torch.cat([cnn_features, states], dim=-1)  # (B, T, combined_dim)
-            combined = self.input_norm(combined)  # Normalize after concat
-        else:
-            if self.n_stack > 1:
-                # Single step: (B, n_stack, C, H, W) -> (B, cnn_output_dim)
-                cnn_features = self._cnn(images)  # (B, cnn_output_dim)
-                # State: (B, n_stack, state_dim) -> take last -> (B, state_dim)
-                states = states[:, -1, :]  # (B, state_dim)
-            else:
-                # Single step: (B, C, H, W) -> (B, cnn_output_dim)
-                cnn_features = self._cnn(images)  # (B, cnn_output_dim)
-                # State: (B, state_dim) - already correct shape
-
-            combined = torch.cat([cnn_features, states], dim=-1)  # (B, combined_dim)
-            combined = self.input_norm(combined)  # Normalize after concat
-            combined = combined.unsqueeze(1)  # (B, 1, combined_dim) for Mamba
-
-        return combined
-
-    def _combine_features(self, cnn_features: torch.Tensor, states: torch.Tensor, is_sequence: bool = False) -> torch.Tensor:
-        """
-        Combine pre-computed CNN features with state (for feature caching).
-
-        Args:
-            cnn_features: (B, T, cnn_output_dim) or (B, cnn_output_dim)
-            states: With n_stack > 1: (B, T, n_stack, state_dim) or (B, n_stack, state_dim)
-                    With n_stack = 1: (B, T, state_dim) or (B, state_dim)
-            is_sequence: whether input is a sequence
-
-        Returns:
-            combined: (B, T, combined_dim) or (B, 1, combined_dim)
-        """
-        states = states.float()
-
-        if is_sequence:
-            if self.n_stack > 1:
-                # State: (B, T, n_stack, state_dim) -> take last of n_stack -> (B, T, state_dim)
-                states = states[:, :, -1, :]  # (B, T, state_dim)
-            # else: (B, T, state_dim) - already correct
-            combined = torch.cat([cnn_features, states], dim=-1)  # (B, T, combined_dim)
-            combined = self.input_norm(combined)
-        else:
-            if self.n_stack > 1:
-                # State: (B, n_stack, state_dim) -> take last -> (B, state_dim)
-                states = states[:, -1, :]  # (B, state_dim)
-            # else: (B, state_dim) - already correct
-            combined = torch.cat([cnn_features, states], dim=-1)  # (B, combined_dim)
-            combined = self.input_norm(combined)
-            combined = combined.unsqueeze(1)  # (B, 1, combined_dim) for Mamba
-
-        return combined
 
     def forward_sequence_from_features(
         self, cnn_features: torch.Tensor, states: torch.Tensor, return_context: bool = False,
@@ -683,7 +580,7 @@ class MambaActor(nn.Module):
         return log_probs_flat.view(B, T)
 
 
-class MambaCritic(nn.Module):
+class MambaCritic(_ObservationEncoder):
     """
     Critic network with Mamba for sequence processing.
     Supports both single-step inference and sequence-based training.
@@ -779,76 +676,9 @@ class MambaCritic(nn.Module):
             q_layers.append(output_layer)
             self.q_networks.append(nn.Sequential(*q_layers))
 
-    def set_cnn(self, cnn: SequenceCNN):
-        self._cnn = cnn
-
     def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
         """Normalize action from actual action space to [-1, 1] for critic input."""
         return (action - self.action_bias) / self.action_scale
-
-    def _process_obs(self, observations: Dict[str, torch.Tensor], is_sequence: bool = False):
-        """Same as MambaActor._process_obs - handles both n_stack > 1 and n_stack = 1"""
-        images = observations["image"].float() / 255.0
-        states = observations["state"].float()
-
-        if is_sequence:
-            if self.n_stack > 1:
-                # (B, T, n_stack, C, H, W) -> (B, T, cnn_output_dim)
-                B, T, n_stack, C, H, W = images.shape
-                images_flat = images.reshape(B * T, n_stack, C, H, W)
-                cnn_features = self._cnn(images_flat).reshape(B, T, -1)
-                states = states[:, :, -1, :]  # (B, T, state_dim)
-            else:
-                # (B, T, C, H, W) -> (B, T, cnn_output_dim)
-                cnn_features = self._cnn(images)  # (B, T, cnn_output_dim)
-                # states: (B, T, state_dim) - already correct
-            combined = torch.cat([cnn_features, states], dim=-1)
-            combined = self.input_norm(combined)
-        else:
-            if self.n_stack > 1:
-                # (B, n_stack, C, H, W) -> (B, cnn_output_dim)
-                cnn_features = self._cnn(images)
-                states = states[:, -1, :]  # (B, state_dim)
-            else:
-                # (B, C, H, W) -> (B, cnn_output_dim)
-                cnn_features = self._cnn(images)
-                # states: (B, state_dim) - already correct
-            combined = torch.cat([cnn_features, states], dim=-1)
-            combined = self.input_norm(combined)
-            combined = combined.unsqueeze(1)
-
-        return combined
-
-    def _combine_features(self, cnn_features: torch.Tensor, states: torch.Tensor, is_sequence: bool = False) -> torch.Tensor:
-        """
-        Combine pre-computed CNN features with state (for feature caching).
-
-        Args:
-            cnn_features: (B, T, cnn_output_dim) or (B, cnn_output_dim)
-            states: With n_stack > 1: (B, T, n_stack, state_dim) or (B, n_stack, state_dim)
-                    With n_stack = 1: (B, T, state_dim) or (B, state_dim)
-            is_sequence: whether input is a sequence
-
-        Returns:
-            combined: (B, T, combined_dim) or (B, 1, combined_dim)
-        """
-        states = states.float()
-
-        if is_sequence:
-            if self.n_stack > 1:
-                states = states[:, :, -1, :]  # (B, T, state_dim)
-            # else: (B, T, state_dim) - already correct
-            combined = torch.cat([cnn_features, states], dim=-1)
-            combined = self.input_norm(combined)
-        else:
-            if self.n_stack > 1:
-                states = states[:, -1, :]  # (B, state_dim)
-            # else: (B, state_dim) - already correct
-            combined = torch.cat([cnn_features, states], dim=-1)
-            combined = self.input_norm(combined)
-            combined = combined.unsqueeze(1)
-
-        return combined
 
     def forward_sequence_from_features(self, cnn_features: torch.Tensor, states: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -1121,21 +951,10 @@ class MambaSACPolicy(SACPolicy):
         )
         self.actor.set_cnn(self.shared_cnn)
 
-        # Actor optimizer configuration based on cnn_update_mode
-        if self.cnn_update_mode == "both":
-            # Both Actor and Critic update CNN - may improve Actor learning
-            # Include shared_cnn parameters in Actor optimizer
-            # Use dict to deduplicate parameters by id
-            actor_param_dict = {id(p): p for p in self.actor.parameters()}
-            cnn_param_dict = {id(p): p for p in self.shared_cnn.parameters()}
-            actor_param_dict.update(cnn_param_dict)
-            actor_params = list(actor_param_dict.values())
-            print(f"    CNN update mode: both (Actor updates CNN)")
-        else:
-            # critic_only: Only Critic optimizer updates CNN (original design)
-            # Actor uses CNN features but doesn't update CNN weights
-            actor_params = [p for p in self.actor.parameters() if p.requires_grad]
-            print(f"    CNN update mode: critic_only (only Critic updates CNN)")
+        # set_cnn registers the shared encoder as a submodule. Keep the original
+        # optimizer parameter order so existing Adam checkpoints resume exactly.
+        actor_params = list(self.actor.parameters())
+        print(f"    CNN update mode: {self.cnn_update_mode} (actor encoder gradients are auxiliary-only)")
 
         # Critic
         print(f"    Critic: {backend_name}(hidden={self.mamba_hidden_dim}) -> MLP{self.critic_hidden}")
@@ -1176,16 +995,8 @@ class MambaSACPolicy(SACPolicy):
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_target.requires_grad_(False)
 
-        # Critic optimizer
-        # When cnn_update_mode="both", CNN is updated by Actor, so Critic doesn't include CNN
-        # When cnn_update_mode="critic_only", CNN is updated by Critic only
+        # The critic loss updates the encoder in both supported modes.
         critic_params = list(self.critic.parameters())
-        if self.cnn_update_mode != "both":
-            # critic_only: Critic optimizer includes CNN
-            cnn_params = list(self.shared_cnn.parameters())
-            all_params = {id(p): p for p in critic_params + cnn_params}
-            critic_params = list(all_params.values())
-
         self.critic.optimizer = self.optimizer_class(
             critic_params,
             lr=lr_schedule(1),
@@ -1194,10 +1005,17 @@ class MambaSACPolicy(SACPolicy):
 
         # Build the optional head last so it cannot change seeded SAC initialization.
         if self.aux_weight > 0:
-            self.aux_predictor = NextDepthPredictor(
-                self.mamba_hidden_dim, self.action_space.shape[0],
-                self.aux_out_h, self.aux_out_w, self.aux_hidden, self.aux_target,
-            )
+            if self.aux_target == "terminal_risk":
+                self.aux_predictor = nn.Sequential(
+                    nn.Linear(self.mamba_hidden_dim, self.aux_hidden),
+                    nn.SiLU(),
+                    nn.Linear(self.aux_hidden, 2),
+                )
+            else:
+                self.aux_predictor = NextDepthPredictor(
+                    self.mamba_hidden_dim, self.action_space.shape[0],
+                    self.aux_out_h, self.aux_out_w, self.aux_hidden, self.aux_target,
+                )
             actor_params += list(self.aux_predictor.parameters())
             if self.cnn_update_mode == "critic_only":
                 print("    [Aux] Warning: critic_only freezes the CNN during the Actor auxiliary update")
@@ -1238,15 +1056,4 @@ class MambaSACPolicy(SACPolicy):
         images = observations["image"].float() / 255.0
 
         cnn = self.target_cnn if use_target else self.shared_cnn
-        n_stack = self.actor.n_stack
-
-        if n_stack > 1:
-            # (B, T, n_stack, C, H, W)
-            B, T, n_stack, C, H, W = images.shape
-            images_flat = images.reshape(B * T, n_stack, C, H, W)
-            cnn_features = cnn(images_flat)  # (B*T, cnn_output_dim)
-            return cnn_features.view(B, T, -1)  # (B, T, cnn_output_dim)
-        else:
-            # (B, T, C, H, W) - use SequenceCNN's sequence handling
-            cnn_features = cnn(images)  # (B, T, cnn_output_dim)
-            return cnn_features
+        return cnn(images)

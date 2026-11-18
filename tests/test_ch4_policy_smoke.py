@@ -74,7 +74,7 @@ def fill_replay(model):
     def observation():
         return {
             'image': rng.integers(0, 256, model.observation_space['image'].shape, dtype=np.uint8),
-            'state': rng.random(6, dtype=np.float32),
+            'state': rng.random(model.observation_space['state'].shape, dtype=np.float32),
         }
 
     for truncated, length in ((False, 3), (True, 6)):
@@ -298,10 +298,23 @@ class Ch4PolicySmokeTest(unittest.TestCase):
                 actor_updates.append(True)
                 self.assertEqual(len(parameters), len({id(p) for p in parameters}))
                 # Independent aux-only forward at the same weights, before clipping or Adam.
-                features = model.policy.extract_cnn_features(batch['observations'])
-                _, _, context = model.policy.actor.forward_sequence_from_features(
-                    features, batch['observations']['state'], return_context=True,
-                )
+                features = model.policy.extract_cnn_features(batch['context_observations'])
+                contexts = []
+                # Independent per-position reference, using the real short/full
+                # history rather than a fresh unroll at the sampled start.
+                for row in range(batch['mask'].shape[0]):
+                    positions = []
+                    for step in range(batch['mask'].shape[1]):
+                        length = int(batch['history_lengths'][row, step])
+                        end = model.policy.actor.inference_seq_len - 1 + step
+                        _, _, value = model.policy.actor.forward_sequence_from_features(
+                            features[row:row + 1, end - length + 1:end + 1],
+                            batch['context_observations']['state'][row:row + 1, end - length + 1:end + 1],
+                            return_context=True,
+                        )
+                        positions.append(value[0, -1])
+                    contexts.append(torch.stack(positions))
+                context = torch.stack(contexts)
                 loss = model.policy.aux_weight * model._compute_aux_loss(context, batch)
                 cnn_parameters = list(model.policy.shared_cnn.parameters())
                 expected = torch.autograd.grad(loss, cnn_parameters)

@@ -161,7 +161,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/win-64/zlib-ng-2.3.3-h0261ad2_1.conda
       - conda: https://conda.anaconda.org/conda-forge/win-64/zstd-1.5.7-h534d264_6.conda
       - pypi: .
-      - pypi: https://files.pythonhosted.org/packages/1f/dc/001d2e7a17af3e8384d8eddae93a56a16ab6e1bf7c06f0383d722e62e9fa/cosysairsim-3.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/21/f0/9fa6e85cb10c8eb36a0222d27e50fe381b86ce49a55446bf39f491727564/opencv_python-5.0.0.93-cp37-abi3-win_amd64.whl
       - pypi: https://files.pythonhosted.org/packages/56/d3/ea5f088e3638dbab12e5c20d6559d5b3bdaeaa1f2af74e526e6815836285/gymnasium-1.2.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/57/7f/ce1e377df7e62461fefd9eb23bfb93a4a523f40a517b377b8f844d836828/msgpack-1.2.1-cp312-cp312-win_amd64.whl
@@ -172,6 +171,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/86/bf/899e81e4cce32febab4fb42bb97dcdf66bc135272882d1987881a4b519e9/pyyaml-6.0.3-cp312-cp312-win_amd64.whl
       - pypi: https://files.pythonhosted.org/packages/88/39/799be3f2f0f38cc727ee3b4f1445fe6d5e4133064ec2e4115069418a5bb6/cloudpickle-3.1.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/e5/6d/b53b99a9f2766d095985947a5782f1702cabb129a34f7a802d7197af832f/tzdata-2026.3-py2.py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/e8/f6/28df22465c317ec7fec4183f08af1e691478ded8b66e12f0bb4fa191fc21/cosysairsim-3.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/f8/fb/9aa0d67f7389c411525f4b48ba20fb53c8e99e27c0240f1dfab391a5cc66/rpc-msgpack-0.6.tar.gz
 packages:
 - conda: https://conda.anaconda.org/conda-forge/noarch/absl-py-2.5.0-pyhd8ed1ab_0.conda
@@ -2633,14 +2633,6 @@ packages:
   requires_dist:
   - gymnasium
   - cosysairsim
-- pypi: https://files.pythonhosted.org/packages/1f/dc/001d2e7a17af3e8384d8eddae93a56a16ab6e1bf7c06f0383d722e62e9fa/cosysairsim-3.3.0-py3-none-any.whl
-  name: cosysairsim
-  version: 3.3.0
-  sha256: 2599d3ce2a4ae50dad0440b16824a7edafbe19ff9336036b0e8fe829dfe5dd77
-  requires_dist:
-  - numpy
-  - rpc-msgpack
-  requires_python: '>=3.7'
 - pypi: https://files.pythonhosted.org/packages/21/f0/9fa6e85cb10c8eb36a0222d27e50fe381b86ce49a55446bf39f491727564/opencv_python-5.0.0.93-cp37-abi3-win_amd64.whl
   name: opencv-python
   version: 5.0.0.93
@@ -2865,6 +2857,14 @@ packages:
   version: '2026.3'
   sha256: dc096730c87af6cab1b171c9d532be840741ff5d459015e7f6947bd7d7e54931
   requires_python: '>=2'
+- pypi: https://files.pythonhosted.org/packages/e8/f6/28df22465c317ec7fec4183f08af1e691478ded8b66e12f0bb4fa191fc21/cosysairsim-3.2.0-py3-none-any.whl
+  name: cosysairsim
+  version: 3.2.0
+  sha256: fa2f356ef0aef52fa7b82702101805c1e3154de070f151a72f886cf4ec25c5ab
+  requires_dist:
+  - numpy
+  - rpc-msgpack
+  requires_python: '>=3.7'
 - pypi: https://files.pythonhosted.org/packages/f8/fb/9aa0d67f7389c411525f4b48ba20fb53c8e99e27c0240f1dfab391a5cc66/rpc-msgpack-0.6.tar.gz
   name: rpc-msgpack
   version: '0.6'
