@@ -23,7 +23,6 @@ class BaseTask(ABC):
             cfg: ConfigParser with task parameters
             env: Reference to AirsimGymEnv for accessing state
         """
-        self.cfg = cfg
         self.env = env
         self.reward_cfg = {}
         self.reward_type = "reward_final"
@@ -42,7 +41,6 @@ class BaseTask(ABC):
         # Common parameters
         self.accept_radius = cfg.getfloat("environment", "accept_radius")
         self.crash_distance = cfg.getfloat("environment", "crash_distance")
-        self.max_episode_steps = cfg.getint("environment", "max_episode_steps")
 
         # Workspace boundaries
         import ast
@@ -216,13 +214,6 @@ class BaseTask(ABC):
             + (pos[1] - goal[1]) ** 2
             + (pos[2] - goal[2]) ** 2
         )
-
-    def get_distance_to_line(self, px, py, x1, y1, x2, y2) -> float:
-        """Calculate distance from point to line (for path deviation penalty)."""
-        a = y2 - y1
-        b = x1 - x2
-        c = x2 * y1 - x1 * y2
-        return abs(a * px + b * py + c) / math.sqrt(a * a + b * b + 1e-8)
 
     def get_info(self) -> dict:
         """Return info dict for step(). Uses cached flags from is_done()."""

@@ -37,7 +37,6 @@ class AirsimGymEnv(gym.Env):
 
     def set_config(self, cfg):
         """Configure environment from .ini config file."""
-        self.cfg = cfg
         self.env_name = cfg.get("options", "env_name")
         self.dynamic_name = cfg.get("options", "dynamic_name")
         self.perception_type = cfg.get("options", "perception")

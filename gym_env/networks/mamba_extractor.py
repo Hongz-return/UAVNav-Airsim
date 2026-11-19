@@ -40,8 +40,6 @@ class TimeDistributedCNN(nn.Module):
             nn.ReLU(),
         )
 
-        self.output_dim = output_dim
-
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -202,8 +200,6 @@ class MambaBlock(nn.Module):
         transformer_layers: int = 2,
     ):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.input_dim = input_dim
         self._backend = None
 
         # Determine target backend

@@ -20,7 +20,6 @@ import numpy as np
 from tools.runtime_support import apply_config_overrides, build_runtime_env, load_model
 from tools.experiment_paths import EVALUATION_RESULTS_ROOT, evaluation_parent_for_run
 
-DEFAULT_MODEL_PATH = "logs/Tunnel_Obs/Mamba"
 DEFAULT_EPISODES = 100
 
 

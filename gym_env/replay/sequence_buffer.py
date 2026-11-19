@@ -126,7 +126,6 @@ class SequenceReplayBuffer:
         self.observation_space = observation_space
         self.action_space = action_space
         self.seq_len = seq_len
-        self.n_envs = n_envs
 
         if device == "auto":
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

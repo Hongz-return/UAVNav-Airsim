@@ -97,11 +97,6 @@ class MultirotorDynamicsAirsim:
         self.goal_position = [0, 0, 0]           # ENU (z up) for math
         self.goal_distance = 0
 
-        # Command state (for logging)
-        self.v_xy_sp = 0
-        self.v_z_sp = 0
-        self.yaw_sp = 0
-
         # Action space config
         self.v_xy_max = cfg.getfloat('multirotor', 'v_xy_max')
         self.v_xy_min = cfg.getfloat('multirotor', 'v_xy_min')
@@ -126,8 +121,6 @@ class MultirotorDynamicsAirsim:
                 dtype=np.float32,
             )
 
-        # State arrays
-        self.state_raw = np.zeros(6)
         self.state_norm = np.zeros(self.state_feature_length)
 
     def reset(self, rng=None):
@@ -231,15 +224,9 @@ class MultirotorDynamicsAirsim:
             if not completed:
                 raise RuntimeError("Failed to execute drone velocity command")
 
-        # Store for state computation
-        self.v_xy_sp = v_forward
-        self.v_z_sp = v_z
-        self.yaw_sp = yaw + yaw_rate * self.dt
-
     def _advance_synchronously(self, vx, vy, vz, yaw_mode, duration=None):
         # Keep the command alive across each physics window; paused inference must not trigger SimpleFlight's 60ms timeout.
         before = self.client.getMultirotorState(vehicle_name=self.vehicle_name).timestamp
-        started = time.monotonic()
         control_duration = self.dt if duration is None else duration
         future = self.client.moveByVelocityAsync(
             vx, vy, vz, control_duration + 1.0,
@@ -270,7 +257,6 @@ class MultirotorDynamicsAirsim:
             # False is expected after cancellation; get() still propagates RPC errors.
             future.get()
         self.last_control_sim_seconds = advanced
-        self.last_control_wall_seconds = time.monotonic() - started
 
     def set_start(self, position, random_angle, fixed_yaw=None):
         """Set start position and random angle range."""
@@ -327,10 +313,6 @@ class MultirotorDynamicsAirsim:
         q = self._vehicle_pose().orientation
         return quaternion_to_euler(q)
 
-    def get_attitude_cmd(self):
-        """Get commanded attitude."""
-        return [0.0, 0.0, self.yaw_sp]
-
     def get_distance_to_goal_2d(self):
         """Get 2D distance to goal (XY plane only)."""
         pos = self.get_position()
@@ -362,11 +344,6 @@ class MultirotorDynamicsAirsim:
         v_forward_norm = (vel[0] - self.v_xy_min) / (self.v_xy_max - self.v_xy_min)
         v_up_norm = vel[1] / self.v_z_max / 2 + 0.5
         vyaw_norm = vel[2] / self.yaw_rate_max_rad / 2 + 0.5
-
-        self.state_raw = np.array([
-            distance, relative_z, math.degrees(relative_yaw),
-            vel[0], vel[1], math.degrees(vel[2])
-        ])
 
         # Clip to [0, 1] and keep as float32
         state_norm = np.clip(

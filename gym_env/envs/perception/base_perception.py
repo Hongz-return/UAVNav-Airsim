@@ -25,7 +25,6 @@ class BasePerception(ABC):
             cfg: ConfigParser with perception parameters
             client: AirSim client for image acquisition
         """
-        self.cfg = cfg
         self.client = client
         self._load_config(cfg)
 

@@ -114,7 +114,6 @@ class SequenceCNN(nn.Module):
             nn.Linear(cnn_flat_dim, output_dim),
             nn.ReLU(),
         )
-        self.output_dim = output_dim
 
     def _resolve_attention_stage(self, attention_stage: str) -> str:
         stage = attention_stage.lower()
@@ -255,11 +254,9 @@ class MambaActor(_ObservationEncoder):
         if len(image_shape) == 4:
             # (n_stack, C, H, W) - with frame stacking
             self.n_stack = image_shape[0]
-            self.channels_first = True  # After VecTransposeImage
         elif len(image_shape) == 3:
             # (C, H, W) - no frame stacking
             self.n_stack = 1
-            self.channels_first = True  # After VecTransposeImage
         else:
             raise ValueError(f"Unexpected image shape: {image_shape}")
 
@@ -270,7 +267,6 @@ class MambaActor(_ObservationEncoder):
             state_dim = state_shape[0]
 
         self.cnn_output_dim = cnn_output_dim
-        self.state_dim = state_dim
 
         # CNN for image features
         self._cnn = None  # Will be set by set_cnn()
@@ -446,33 +442,6 @@ class MambaActor(_ObservationEncoder):
             return actions_scaled.view(B, T, -1), log_probs_flat.view(B, T), context
         return actions_scaled.view(B, T, -1), log_probs_flat.view(B, T)
 
-    def forward_sequence(self, observations: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Process a sequence of observations.
-
-        Args:
-            observations: Dict with 'image' (B, T, n_stack, C, H, W), 'state' (B, T, n_stack, state_dim)
-
-        Returns:
-            mean: (B, T, action_dim)
-            log_std: (B, T, action_dim)
-        """
-        combined = self._process_obs(observations, is_sequence=True)  # (B, T, combined_dim)
-
-        # Mamba processes full sequence
-        context = self.mamba(combined, return_full_seq=True)  # (B, T, hidden_dim)
-        context = self.context_norm(context)
-
-        # Actor head for each timestep
-        B, T, _ = context.shape
-        context_flat = context.view(B * T, -1)
-        features = self.head(context_flat)
-        mean = self.mu(features)
-        log_std = self.log_std(features)
-        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
-
-        return mean.view(B, T, -1), log_std.view(B, T, -1)
-
     def forward(self, observations: Dict[str, torch.Tensor], deterministic: bool = False, use_history: bool = True) -> torch.Tensor:
         """
         Single step forward for inference. Returns scaled actions.
@@ -529,56 +498,6 @@ class MambaActor(_ObservationEncoder):
         log_prob = self.action_dist.log_prob(actions)
         return self.scale_action(actions), log_prob  # Return scaled actions
 
-    def action_log_prob_sequence(self, observations: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Get actions and log probs for a sequence.
-
-        Returns:
-            actions: (B, T, action_dim) - SCALED to actual action space
-            log_probs: (B, T)
-        """
-        mean, log_std = self.forward_sequence(observations)  # (B, T, action_dim)
-        B, T, _ = mean.shape
-
-        # Sample actions for each timestep
-        mean_flat = mean.view(B * T, -1)
-        log_std_flat = log_std.view(B * T, -1)
-
-        self.action_dist.proba_distribution(mean_flat, log_std_flat)
-        actions_flat = self.action_dist.get_actions(deterministic=False)  # [-1, 1]
-        log_probs_flat = self.action_dist.log_prob(actions_flat)
-
-        # Scale actions to actual action space
-        actions_scaled = self.scale_action(actions_flat)
-
-        return actions_scaled.view(B, T, -1), log_probs_flat.view(B, T)
-
-    def log_prob_from_scaled_actions(self, observations: Dict[str, torch.Tensor], scaled_actions: torch.Tensor) -> torch.Tensor:
-        """
-        Compute log probability of scaled actions (from buffer).
-
-        Args:
-            observations: Dict with 'image' (B, T, n_stack, C, H, W), 'state' (B, T, n_stack, state_dim)
-            scaled_actions: (B, T, action_dim) - actions in actual action space
-
-        Returns:
-            log_probs: (B, T)
-        """
-        mean, log_std = self.forward_sequence(observations)  # (B, T, action_dim)
-        B, T, _ = mean.shape
-
-        # Unscale actions to [-1, 1] for log_prob computation
-        unscaled_actions = self.unscale_action(scaled_actions)  # (B, T, action_dim)
-
-        mean_flat = mean.view(B * T, -1)
-        log_std_flat = log_std.view(B * T, -1)
-        unscaled_actions_flat = unscaled_actions.view(B * T, -1)
-
-        self.action_dist.proba_distribution(mean_flat, log_std_flat)
-        log_probs_flat = self.action_dist.log_prob(unscaled_actions_flat)
-
-        return log_probs_flat.view(B, T)
-
 
 class MambaCritic(_ObservationEncoder):
     """
@@ -604,7 +523,6 @@ class MambaCritic(_ObservationEncoder):
     ):
         super().__init__()
 
-        self.n_critics = n_critics
         self.action_dim = action_space.shape[0]
 
         # Action normalization: scale actions to [-1, 1] for critic input
@@ -621,11 +539,9 @@ class MambaCritic(_ObservationEncoder):
         if len(image_shape) == 4:
             # (n_stack, C, H, W) - with frame stacking
             self.n_stack = image_shape[0]
-            self.channels_first = True
         elif len(image_shape) == 3:
             # (C, H, W) - no frame stacking
             self.n_stack = 1
-            self.channels_first = True
         else:
             raise ValueError(f"Unexpected image shape: {image_shape}")
 
@@ -636,7 +552,6 @@ class MambaCritic(_ObservationEncoder):
             state_dim = state_shape[0]
 
         self.cnn_output_dim = cnn_output_dim
-        self.state_dim = state_dim
 
         self._cnn = None
 
