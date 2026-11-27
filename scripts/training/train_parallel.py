@@ -25,20 +25,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.airsim_instances import auto_pin_p_core, launch_instances, terminate_processes
+from tools.experiment_config import DEFAULT_METHODS, METHOD_CONFIGS
 from tools.experiment_paths import PARALLEL_RUNS_ROOT, TRAIN_RUNS_ROOT
 
-
-METHOD_CONFIGS = {
-    "sac": Path("configs/config_sac_framestack4.ini"),
-    "coordatt": Path("configs/config_coordatt_sac.ini"),
-    "lstm": Path("configs/config_lstm.ini"),
-    "mamba": Path("configs/config_mamba.ini"),
-    "ma": Path("configs/config_mamba_coordatt.ini"),
-    "transformer": Path("configs/config_transformer.ini"),
-    "ma_motion": Path("configs/config_ma_motion.ini"),
-    "ma_aux": Path("configs/config_ma_aux.ini"),
-    "ma_motion_aux": Path("configs/config_ma_motion_aux.ini"),
-}
 
 SCENES = {
     "tunnel": {
@@ -72,7 +61,6 @@ SCENES = {
     },
 }
 
-DEFAULT_METHODS = ["sac", "coordatt", "lstm", "mamba", "ma", "transformer"]
 DEFAULT_SEEDS = [0, 1, 2]
 DEFAULT_MAX_PARALLEL = 3
 

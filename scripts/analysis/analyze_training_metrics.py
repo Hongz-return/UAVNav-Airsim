@@ -12,7 +12,8 @@ from pathlib import Path
 
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-from scripts.training.train_parallel import DEFAULT_METHODS, SCENES
+from scripts.training.train_parallel import SCENES
+from tools.experiment_config import DEFAULT_METHODS
 from tools.experiment_paths import TRAIN_RUNS_ROOT
 
 METRICS = (

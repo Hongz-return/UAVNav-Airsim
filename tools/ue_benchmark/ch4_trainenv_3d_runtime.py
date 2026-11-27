@@ -1,6 +1,5 @@
 """Shared AirSim telemetry for the TrainEnv_3D flight and commissioning runs."""
 
-from configparser import ConfigParser
 from contextlib import contextmanager
 import json
 import math
@@ -8,6 +7,11 @@ import math
 import cosysairsim as airsim
 import numpy as np
 
+from tools.experiment_config import (
+    CH4_OBSERVATION_CONTRACT as CH4_OBSERVATION_CONTRACT,
+    assert_observation_contract as assert_observation_contract,
+    read_ini as read_ini,
+)
 from tools.ue_benchmark.ch4_trainenv_3d_course import ROOT, obstacles, position_agl, structural_boxes
 
 
@@ -16,31 +20,6 @@ TRAIN_CONFIG = ROOT / "configs/ch4_train_trainenv_3d.ini"
 SETTINGS_TEMPLATE = ROOT / "configs/ch4_trainenv_3d_airsim.json"
 VEHICLE = "SimpleFlight"
 SPAWN = [0.0, 0.0, 0.0]
-CH4_OBSERVATION_CONTRACT = {
-    ("options", "navigation_3d"): "True",
-    ("options", "using_velocity_state"): "True",
-    ("options", "perception"): "depth_state",
-    ("environment", "max_depth_meters"): "25",
-    ("environment", "screen_height"): "60",
-    ("environment", "screen_width"): "90",
-    ("environment", "distance_norm_scale"): "200.0",
-    ("environment", "max_vertical_difference"): "2.0",
-    ("mamba", "n_stack"): "1",
-    ("mamba", "inference_seq_len"): "8",
-}
-
-
-def read_ini(path):
-    cfg = ConfigParser()
-    with path.open(encoding="utf-8-sig") as handle:
-        cfg.read_file(handle)
-    return cfg
-
-
-def assert_observation_contract(cfg):
-    for key, value in CH4_OBSERVATION_CONTRACT.items():
-        if cfg.get(*key) != value:
-            raise RuntimeError(f"Unexpected checkpoint input contract at {key}: {cfg.get(*key)}")
 
 
 def json_line(handle, document):

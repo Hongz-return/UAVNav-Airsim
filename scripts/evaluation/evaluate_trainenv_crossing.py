@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
 
+from tools.experiment_config import assert_observation_contract, read_ini
 from tools.runtime_support import _build_monitored_env, load_model
 from tools.trainenv_instances import DEFAULT_EXE, TRAINENV_MAP, launch_trainenv
 from tools.ue_benchmark.ch4_stage3_crossing import (
@@ -25,7 +26,7 @@ from tools.ue_benchmark.ch4_stage3_crossing import (
 )
 from tools.ue_benchmark.ch4_stage3_v2_course import SPAWN_NED, TransientBoxes, tunnel_roof
 from tools.ue_benchmark.ch4_trainenv_3d_course import ROOT, read_json, sha256, write_json
-from tools.ue_benchmark.ch4_trainenv_3d_runtime import assert_observation_contract, json_line, read_ini
+from tools.ue_benchmark.ch4_trainenv_3d_runtime import json_line
 from tools.ue_benchmark.ch4_trainenv_crossing_audit import (
     MAX_UNBLOCKED_LAG_M, MAX_UPDATE_GAP_S, NEAR_SURFACE_M, SURVEY, assert_surveyed_section, capture_depth,
     check_scene, current_obstacle, depth_geometry, distance_to_box, episode_clearance, surveyed_boxes,

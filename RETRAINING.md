@@ -56,19 +56,10 @@ pixi run python -m scripts.training.train_parallel `
 --ports 41451 41461 41471
 ```
 
-新动静混合场景在本机只训练 `sac`、`coordatt` 和 `lstm`，三种方法均使用
+历史动静混合场景在本机只训练 `sac`、`coordatt` 和 `lstm`，三种方法均使用
 seed `0 1 2`、每个任务 200,000 steps，并统一从新打包的
-`D:\UEBuilds\TunnelEnv\Windows\Tunnel.exe` 启动 `Tunnel_AO`。先检查计划：
-
-```powershell
-.\archive\scripts\training\train_env4_local.ps1
-```
-
-确认计划后，一键启动本机的 9 个正式训练任务：
-
-```powershell
-.\archive\scripts\training\train_env4_local.ps1 -Execute
-```
+`D:\UEBuilds\TunnelEnv\Windows\Tunnel.exe` 启动 `Tunnel_AO`。原本机脚本保存在
+Git 提交 `1a818ce` 的 `archive/scripts/training/train_env4_local.ps1` 中。
 
 该入口不会训练 `mamba`、`ma` 和 `transformer`；三者保留给另一台电脑，
 合并结果时必须保持相同的场景、步数、seed 和算法配置。

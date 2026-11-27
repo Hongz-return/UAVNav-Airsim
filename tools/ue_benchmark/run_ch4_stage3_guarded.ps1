@@ -26,19 +26,14 @@ try {
     }
 }
 finally {
-    # Each Python UE launcher also binds its own process tree to a kill-on-close Job.
-    $remainder = @(Get-StageSimulator)
-    foreach ($process in $remainder) {
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-        Wait-Process -Id $process.Id -Timeout 10 -ErrorAction SilentlyContinue
-    }
+    # Python launchers own their UE process trees. Other processes can start during the stage.
     $after = @(Get-StageSimulator)
     [PSCustomObject]@{
         stage = $Stage
         timestamp = Get-Date -Format o
-        cleaned = @($remainder | Select-Object Id,ProcessName)
+        cleaned = @()
         remaining = @($after | Select-Object Id,ProcessName)
     } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $report "process_cleanup_$Stage.json") -Encoding utf8
     Write-Host "[$Stage] simulator processes remaining: $($after.Count)"
-    if ($after.Count) { throw "$Stage left simulator processes" }
+    if ($after.Count) { throw "Simulator processes are present after $Stage; see the stage report." }
 }
