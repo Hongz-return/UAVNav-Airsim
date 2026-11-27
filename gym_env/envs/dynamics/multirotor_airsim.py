@@ -78,8 +78,8 @@ class MultirotorDynamicsAirsim:
         self.airsim_timeout = cfg.getfloat('airsim', 'timeout_value', fallback=3600.0)
         self.synchronous_steps = cfg.getboolean('airsim', 'synchronous_steps', fallback=False)
         self.cache_step_state = cfg.getboolean('airsim', 'cache_step_state', fallback=False)
-        if self._forest_reset and (not self.synchronous_steps or not self.vehicle_name):
-            raise ValueError('NavRL forest requires synchronous AirSim steps and a named UE vehicle')
+        if self._forest_reset and not self.vehicle_name:
+            raise ValueError('NavRL forest requires a named UE vehicle')
 
         # AirSim client (shared if provided, else create new)
         if client is not None:
@@ -94,10 +94,10 @@ class MultirotorDynamicsAirsim:
             self.client.confirmConnection()
             self._owns_client = True
 
-        if self.synchronous_steps:
+        if self.synchronous_steps or self._forest_reset:
             settings = json.loads(self.client.getSettingsString())
             if settings.get('ClockType') != 'SteppableClock':
-                raise ValueError('synchronous_steps requires AirSim ClockType=SteppableClock')
+                raise ValueError('Stepped control and NavRL airborne resets require AirSim ClockType=SteppableClock')
             if self._forest_reset:
                 clock_speed = settings.get('ClockSpeed', 1.0)
                 if type(clock_speed) not in (int, float) or clock_speed not in (1, 2):
@@ -142,13 +142,17 @@ class MultirotorDynamicsAirsim:
 
     def reset(self, rng=None):
         """Reset drone to start position and take off."""
-        if self.synchronous_steps:
-            self.client.simPause(True)
+        if not (self.synchronous_steps or self._forest_reset):
+            return self._reset_vehicle(rng)
+        self.client.simPause(True)
         try:
             self._reset_vehicle(rng)
-        finally:
-            if self.synchronous_steps:
-                self.client.simPause(True)
+        except BaseException:
+            self.client.simPause(True)
+            raise
+        # The forest always settles and validates the spawn while paused.
+        # Continuous collection then leaves physics running between actions.
+        self.client.simPause(self.synchronous_steps)
 
     def _reset_vehicle(self, rng):
         # Only reset all if we own the client (single vehicle mode)
@@ -173,7 +177,7 @@ class MultirotorDynamicsAirsim:
                 else 0.0
             )
             yaw = base_yaw + self.start_random_angle * (2.0 * random_source.random() - 1.0)
-        if self.synchronous_steps:
+        if self.synchronous_steps or self._forest_reset:
             state = airsim.KinematicsState()
             state.position = airsim.Vector3r(*self.start_position)
             state.orientation = to_quaternion(0, 0, yaw)

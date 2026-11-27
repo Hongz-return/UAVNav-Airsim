@@ -19,6 +19,7 @@ class MultirotorResetTest(unittest.TestCase):
         dynamics.client.simGetCollisionInfo.return_value = SimpleNamespace(has_collided=False)
         dynamics._owns_client = True
         dynamics.synchronous_steps = False
+        dynamics._forest_reset = False
         dynamics.vehicle_name = 'SimpleFlight'
         dynamics.start_fixed_yaw = 0.0
         dynamics.start_random_angle = 0.0
@@ -120,6 +121,22 @@ class MultirotorResetTest(unittest.TestCase):
         self.assertEqual(list(state.linear_velocity), [0, 0, 0])
         self.assertEqual(list(state.angular_velocity), [0, 0, 0])
         self.assertTrue(dynamics._advance_synchronously.call_args.args[3].is_rate)
+
+    def test_continuous_forest_settles_the_pawn_then_runs_freely(self):
+        dynamics = self.make_dynamics()
+        dynamics._forest_reset = True
+        dynamics._advance_synchronously = Mock()
+        dynamics._validate_reset_state = Mock()
+        dynamics.reset()
+        dynamics.client.simSetObjectPose.assert_called_once()
+        dynamics.client.simSetKinematics.assert_called_once()
+        dynamics._validate_reset_state.assert_called_once_with(0.0)
+        dynamics.client.simPause.assert_called_with(False)
+
+        dynamics._validate_reset_state.side_effect = RuntimeError('invalid spawn')
+        with self.assertRaisesRegex(RuntimeError, 'invalid spawn'):
+            dynamics.reset()
+        dynamics.client.simPause.assert_called_with(True)
 
     def test_invalid_reset_is_rejected_before_an_episode_can_start(self):
         dynamics = self.make_dynamics()

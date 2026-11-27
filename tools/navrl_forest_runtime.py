@@ -50,7 +50,7 @@ def sample_training_route(rng, route_portals=None):
     return start, goal, math.atan2(goal[1] - start[1], goal[0] - start[0])
 
 
-def forest_config(base, stage, *, route_portals=None):
+def forest_config(base, stage, *, route_portals=None, synchronous_steps=True):
     """Apply the open-arena geometry without changing the MA-SAC policy contract."""
     if (base.get("options", "algo") != "SAC" or base.get("options", "perception") != "depth_state"
             or not base.getboolean("options", "use_mamba")
@@ -77,7 +77,7 @@ def forest_config(base, stage, *, route_portals=None):
         "airsim": {
             "ip": "127.0.0.1",
             "vehicle_name": VEHICLE_NAME,
-            "synchronous_steps": True,
+            "synchronous_steps": synchronous_steps,
             "depth_only": True,
             "cache_step_state": True,
             "timeout_value": base.getfloat("airsim", "timeout_value", fallback=15.0),

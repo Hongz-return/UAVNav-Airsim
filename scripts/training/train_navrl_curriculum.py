@@ -65,7 +65,7 @@ def launch_stage(args, stage, ports, directory, settings):
 class ForestPromotion(BaseCallback):
     """Evaluate the current weights independently and stop learning on a pass."""
 
-    def __init__(self, stage, rules, stage_dir, budget, interval, evaluate):
+    def __init__(self, stage, rules, stage_dir, budget, interval, evaluate, *, continuous_training=False):
         super().__init__()
         self.stage = stage
         self.rules = rules
@@ -73,6 +73,7 @@ class ForestPromotion(BaseCallback):
         self.budget = budget
         self.interval = interval
         self.evaluate = evaluate
+        self.continuous_training = continuous_training
         self.rounds = []
         self.decision = {"decision": "stay"}
         self.promotion_checkpoint = None
@@ -95,7 +96,13 @@ class ForestPromotion(BaseCallback):
         cases = self.rules["evaluation_scenarios"](self.stage.number, round_id)
         write_json(round_dir / "scenario_manifest.json", cases)
         print(f"[NavRL] Stage {self.stage.number} evaluation {round_id} at +{elapsed} transitions", flush=True)
-        outcomes = self.evaluate(checkpoint, round_dir, cases["scenarios"])
+        if self.continuous_training:
+            self.training_env.env_method("pause_for_evaluation", True)
+        try:
+            outcomes = self.evaluate(checkpoint, round_dir, cases["scenarios"])
+        finally:
+            if self.continuous_training:
+                self.training_env.env_method("pause_for_evaluation", False)
         expected_ids = [case["scenario_id"] for case in cases["scenarios"]]
         if ([row["scenario_id"] for row in outcomes] != expected_ids
                 or any(type(row["collision_free_success"]) is not bool for row in outcomes)):
@@ -141,6 +148,7 @@ def run_course(args):
     rules = load_protocol(args.ue_project, args.scene_version)
     stages = rules["STAGES"]
     route_portals = rules["V2_ROUTE_PORTALS"] if args.scene_version >= 2 else None
+    stepped_training = args.step_mode == "stepped"
     training_ports = list(range(args.first_port, args.first_port + args.instances))
     evaluation_port = training_ports[-1] + 1
     template = load_settings(args.ue_project.parent / "Config" / "AirSim.settings.json")
@@ -160,6 +168,8 @@ def run_course(args):
         "stages": [stage._asdict() for stage in stages],
         "scene_version": args.scene_version,
         "clock_speed": args.clock_speed,
+        "training_step_mode": args.step_mode,
+        "evaluation_step_mode": "stepped",
         "episodes_per_round": rules["EPISODES_PER_ROUND"],
         "success_rate_strictly_above": rules["SUCCESS_RATE_THRESHOLD"],
         "consecutive_passes": rules["CONSECUTIVE_PASSES"],
@@ -170,7 +180,11 @@ def run_course(args):
     for stage in stages:
         stage_dir = root / f"stage_{stage.number}"
         stage_dir.mkdir()
-        cfg = forest_config(base, stage, route_portals=route_portals)
+        cfg = forest_config(base, stage, route_portals=route_portals, synchronous_steps=stepped_training)
+        cfg.read_dict({"DRL": {
+            "fast_history": args.fast_history,
+            "overlap_updates": args.overlap_updates and args.instances > 1,
+        }})
         cfg.set("navrl_forest", "goal_dir", str(stage_dir).replace("%", "%%"))
         evaluation_cfg = forest_config(base, stage, route_portals=route_portals)
         evaluation_cfg.remove_option("navrl_forest", "goal_dir")
@@ -180,7 +194,8 @@ def run_course(args):
             with launch_stage(args, stage, [evaluation_port], directory, settings):
                 return evaluate_checkpoint(checkpoint, evaluation_cfg, cases, seed=args.seed)
 
-        callback = ForestPromotion(stage, rules, stage_dir, args.stage_steps, args.eval_every, evaluate)
+        callback = ForestPromotion(stage, rules, stage_dir, args.stage_steps, args.eval_every, evaluate,
+                                   continuous_training=not stepped_training)
         training_args = parse_training_args([
             "--config", str(args.config), "--timesteps", str(args.stage_steps),
             "--seed", str(args.seed), "--checkpoint-every", str(args.checkpoint_every),
@@ -189,6 +204,9 @@ def run_course(args):
             *(["--resume", str(resume)] if resume is not None else []),
         ])
         print(f"[NavRL] Stage {stage.number} {stage.static_count}+{stage.dynamic_count}: {stage.map_path}", flush=True)
+        print(f"[NavRL] {args.instances} training instance(s), {args.clock_speed:g}x, {args.step_mode}, "
+              f"fast_history={args.fast_history}, overlap_updates={cfg.getboolean('DRL', 'overlap_updates')}; "
+              "independent evaluation uses stepped control", flush=True)
         with launch_stage(args, stage, training_ports, stage_dir, settings) as job:
             run_training(training_args, cfg, run_dir=stage_dir, simulator_job=job, extra_callbacks=[callback])
 
@@ -214,11 +232,15 @@ def parse_args(argv=None):
     parser.add_argument("--ue-exe", type=Path, default=DEFAULT_EDITOR)
     parser.add_argument("--scene-version", type=int, choices=(1, 2, 3), default=3,
                         help="Forest map version (default: 3 with obstacles throughout the arena)")
-    parser.add_argument("--clock-speed", type=float, choices=(1.0, 2.0), default=1.0,
-                        help="AirSim SteppableClock multiplier for training and evaluation (default: 1)")
+    parser.add_argument("--clock-speed", type=float, choices=(1.0, 2.0), default=2.0,
+                        help="AirSim clock multiplier for training and evaluation (default: 2)")
+    parser.add_argument("--step-mode", choices=("realtime", "stepped"), default="realtime",
+                        help="Run the training worlds continuously or pause after every action")
+    parser.add_argument("--fast-history", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--overlap-updates", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--resume", type=Path, help="Optional initial MA-SAC checkpoint for stage 1")
-    parser.add_argument("--instances", type=int, default=1, help="Training instances, plus one separate evaluator")
+    parser.add_argument("--instances", type=int, default=4, help="Training instances, plus one separate evaluator")
     parser.add_argument("--first-port", type=int, default=41811)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--stage-steps", type=int, default=300_000, help="Maximum new transitions per stage")

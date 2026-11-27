@@ -275,6 +275,10 @@ class AirsimGymEnv(gym.Env):
         self.dynamic_model._set_goal_pose_single(goal_position)
         self.current_scenario = scenario
 
+    def pause_for_evaluation(self, paused):
+        """Hold a continuous training world while its independent evaluation runs."""
+        self.client.simPause(paused)
+
     def _execute_action(self, action):
         """Execute the policy action directly."""
         if self.stage3_course is not None and self._evaluation_scenarios is None:

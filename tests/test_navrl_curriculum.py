@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 from scripts.training.train_navrl_curriculum import ForestPromotion, launch_stage, load_protocol
 
@@ -103,6 +103,19 @@ class ForestPromotionTests(unittest.TestCase):
             self.assertIsNone(callback.promotion_checkpoint)
             self.assertFalse(callback.rounds)
             self.assertFalse(list(Path(tmp).rglob("result.json")))
+
+    def test_continuous_training_worlds_pause_for_the_independent_evaluator(self):
+        with TemporaryDirectory() as tmp:
+            callback = self.callback(Path(tmp), Mock(side_effect=RuntimeError("evaluation failed")))
+            callback.continuous_training = True
+            workers = Mock()
+            callback.model.get_env = lambda: workers
+            callback.model.num_timesteps = 110
+            with self.assertRaisesRegex(RuntimeError, "evaluation failed"):
+                callback._on_step()
+            self.assertEqual(workers.env_method.call_args_list, [
+                call("pause_for_evaluation", True), call("pause_for_evaluation", False),
+            ])
 
     def test_v2_records_core_crossings_separately_from_arrivals(self):
         def v2_scenarios(stage, round_id):
