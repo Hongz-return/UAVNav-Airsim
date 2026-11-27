@@ -72,3 +72,33 @@ class ForestPromotionTests(unittest.TestCase):
             self.assertIsNone(callback.promotion_checkpoint)
             self.assertFalse(callback.rounds)
             self.assertFalse(list(Path(tmp).rglob("result.json")))
+
+    def test_v2_records_core_crossings_separately_from_arrivals(self):
+        def v2_scenarios(stage, round_id):
+            cases = _scenarios(stage, round_id)
+            for case in cases["scenarios"]:
+                case["crossing_axis"] = 0
+            return cases
+
+        def evaluate(_checkpoint, _directory, cases):
+            return [
+                {
+                    "scenario_id": case["scenario_id"],
+                    "collision_free_success": i < 41,
+                    "crossed_core": i < 30,
+                    "core_path_fraction": 0.5 if i < 30 else 0.0,
+                }
+                for i, case in enumerate(cases)
+            ]
+
+        with TemporaryDirectory() as tmp:
+            callback = self.callback(Path(tmp), evaluate)
+            callback.rules["evaluation_scenarios"] = v2_scenarios
+            callback.model.num_timesteps = 110
+            self.assertTrue(callback._on_step())
+            result_path = Path(tmp) / "evaluations" / "round_001" / "result.json"
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(result["collision_free_successes"], 41)
+            self.assertEqual(result["core_crossing_episodes"], 30)
+            self.assertAlmostEqual(result["core_crossing_rate"], 0.6)
+            self.assertAlmostEqual(result["mean_core_path_fraction"], 0.3)

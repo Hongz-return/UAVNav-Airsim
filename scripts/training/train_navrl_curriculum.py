@@ -3,6 +3,7 @@
 import argparse
 from configparser import ConfigParser
 from datetime import datetime
+from functools import partial
 import json
 import math
 from pathlib import Path
@@ -33,9 +34,14 @@ def write_json(path, data):
     temporary.replace(path)
 
 
-def load_protocol(project):
+def load_protocol(project, scene_version=2):
     source = project.parent / "Tools" / "NavRL" / "navrl_curriculum.py"
     rules = runpy.run_path(str(source))
+    if scene_version == 2:
+        if "V2_STAGES" not in rules:
+            raise ValueError(f"The Unreal project does not define the V2 forest maps in {source}.")
+        rules["STAGES"] = rules["V2_STAGES"]
+        rules["evaluation_scenarios"] = partial(rules["evaluation_scenarios"], scene_version=2)
     for stage in rules["STAGES"]:
         relative = stage.map_path.removeprefix("/Game/")
         if relative == stage.map_path:
@@ -101,12 +107,25 @@ class ForestPromotion(BaseCallback):
             "num_timesteps": self.model.num_timesteps,
             "checkpoint": str(checkpoint),
         }
+        if "crossing_axis" in cases["scenarios"][0]:
+            if any(type(row.get("crossed_core")) is not bool for row in outcomes):
+                raise RuntimeError("V2 evaluation outcomes must include actual core crossings.")
+            crossings = sum(row["crossed_core"] for row in outcomes)
+            record.update(
+                core_crossing_episodes=crossings,
+                core_crossing_rate=crossings / len(outcomes),
+                mean_core_path_fraction=math.fsum(row["core_path_fraction"] for row in outcomes) / len(outcomes),
+            )
         decision = self.rules["decide"](self.stage.number, [*self.rounds, record])
         write_json(round_dir / "result.json", {**record, **decision, "outcomes": outcomes})
         self.rounds.append(record)
         self.decision = decision
         print(f"[NavRL] Stage {self.stage.number}: {record['collision_free_successes']}/"
               f"{record['completed_episodes']} collision-free arrivals, {decision['decision']}", flush=True)
+        if "core_crossing_episodes" in record:
+            print(f"[NavRL] Stage {self.stage.number}: {record['core_crossing_episodes']}/"
+                  f"{record['completed_episodes']} crossed the core, "
+                  f"mean core path fraction {record['mean_core_path_fraction']:.1%}", flush=True)
         if decision["decision"] in ("advance", "completed"):
             self.promotion_checkpoint = checkpoint
             return False
@@ -118,8 +137,9 @@ def run_course(args):
     base = ConfigParser()
     with args.config.open(encoding="utf-8-sig") as handle:
         base.read_file(handle)
-    rules = load_protocol(args.ue_project)
+    rules = load_protocol(args.ue_project, args.scene_version)
     stages = rules["STAGES"]
+    route_portals = rules["V2_ROUTE_PORTALS"] if args.scene_version == 2 else None
     training_ports = list(range(args.first_port, args.first_port + args.instances))
     evaluation_port = training_ports[-1] + 1
     template = load_settings(args.ue_project.parent / "Config" / "AirSim.settings.json")
@@ -130,13 +150,14 @@ def run_course(args):
     camera["X"] = CAMERA_FORWARD_M
     template["MoveWorldOrigin"] = False
     # Validate the learning contract before creating a run or starting simulators.
-    forest_config(base, stages[0])
+    forest_config(base, stages[0], route_portals=route_portals)
     root = args.run_dir
     root.mkdir(parents=True, exist_ok=False)
     settings = root / "airsim_template.json"
     write_json(settings, template)
     write_json(root / "curriculum.json", {
         "stages": [stage._asdict() for stage in stages],
+        "scene_version": args.scene_version,
         "episodes_per_round": rules["EPISODES_PER_ROUND"],
         "success_rate_strictly_above": rules["SUCCESS_RATE_THRESHOLD"],
         "consecutive_passes": rules["CONSECUTIVE_PASSES"],
@@ -147,9 +168,9 @@ def run_course(args):
     for stage in stages:
         stage_dir = root / f"stage_{stage.number}"
         stage_dir.mkdir()
-        cfg = forest_config(base, stage)
+        cfg = forest_config(base, stage, route_portals=route_portals)
         cfg.set("navrl_forest", "goal_dir", str(stage_dir).replace("%", "%%"))
-        evaluation_cfg = forest_config(base, stage)
+        evaluation_cfg = forest_config(base, stage, route_portals=route_portals)
         evaluation_cfg.remove_option("navrl_forest", "goal_dir")
         evaluation_cfg.set("airsim", "rpc_port", str(evaluation_port))
 
@@ -189,6 +210,8 @@ def parse_args(argv=None):
     parser.add_argument("-c", "--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--ue-project", type=Path, default=DEFAULT_PROJECT)
     parser.add_argument("--ue-exe", type=Path, default=DEFAULT_EDITOR)
+    parser.add_argument("--scene-version", type=int, choices=(1, 2), default=2,
+                        help="Forest map version (default: 2 with opposite-side routes)")
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--resume", type=Path, help="Optional initial MA-SAC checkpoint for stage 1")
     parser.add_argument("--instances", type=int, default=1, help="Training instances, plus one separate evaluator")

@@ -38,6 +38,7 @@ class AirsimGymEnv(gym.Env):
         self.training_routes = []
         self.stage3_course = None
         self.navrl_forest = False
+        self._navrl_route_portals = None
         self._navrl_goal_path = None
         self.print_airsim_log = False
         # Evaluation-only switch: keep episodes alive after collision events
@@ -54,6 +55,11 @@ class AirsimGymEnv(gym.Env):
         self.dynamic_name = cfg.get("options", "dynamic_name")
         self.perception_type = cfg.get("options", "perception")
         self.navrl_forest = cfg.has_section("navrl_forest")
+        self._navrl_route_portals = None
+        if self.navrl_forest and cfg.has_option("navrl_forest", "route_portals"):
+            from tools.navrl_forest_runtime import parse_route_portals
+
+            self._navrl_route_portals = parse_route_portals(cfg.get("navrl_forest", "route_portals"))
         self.print_airsim_log = cfg.getboolean("options", "print_airsim_log", fallback=False)
         reward_type = cfg.get("options", "reward_type", fallback="reward_final")
         use_pid_residual = cfg.getboolean("options", "use_pid_residual", fallback=False)
@@ -167,7 +173,7 @@ class AirsimGymEnv(gym.Env):
         elif self.navrl_forest and self._evaluation_scenarios is None:
             from tools.navrl_forest_runtime import sample_training_route
 
-            start, goal, yaw = sample_training_route(self.np_random)
+            start, goal, yaw = sample_training_route(self.np_random, self._navrl_route_portals)
             self.dynamic_model.set_start(start, random_angle=0.0, fixed_yaw=yaw)
             self.dynamic_model._set_goal_pose_single(goal)
             live_goal_ned = goal
