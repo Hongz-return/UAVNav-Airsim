@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 from scripts.evaluation.evaluate_single import get_base_env
+from tools.experiment_config import assert_observation_contract, read_ini
 from tools.runtime_support import build_runtime_env, load_model
 from tools.trainenv_instances import DEFAULT_3D_EXE, DEFAULT_EDITOR, HOST, TRAINENV_3D_MAP, launch_trainenv
 from tools.ue_benchmark.ch4_trainenv_3d_course import (
@@ -23,8 +24,8 @@ from tools.ue_benchmark.ch4_trainenv_3d_course import (
 )
 from tools.ue_benchmark.ch4_trainenv_3d_runtime import (
     REPORT, SETTINGS_TEMPLATE, SPAWN, TRAIN_CONFIG, VEHICLE, DepthAudit,
-    assert_observation_contract, assert_reset_depth_consistent, collision_details, json_line, progress_through_obstacles,
-    read_ini, scenario_errors, start_sample, step_sample,
+    assert_reset_depth_consistent, collision_details, json_line, progress_through_obstacles,
+    scenario_errors, start_sample, step_sample,
 )
 
 

@@ -5,7 +5,6 @@ the manifest used here. Use --verify or --evaluate to run only one phase.
 """
 
 import argparse
-import configparser
 import hashlib
 import json
 import math
@@ -23,6 +22,7 @@ import cv2
 import numpy as np
 
 from tools.airsim_instances import validate_ports_available
+from tools.experiment_config import read_ini
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -55,13 +55,6 @@ def write_json(path, val):
 
 def read_json(path):
     return json.loads(path.read_text(encoding="utf-8-sig"))
-
-
-def read_ini(path):
-    config = configparser.ConfigParser()
-    with path.open(encoding="utf-8-sig") as handle:
-        config.read_file(handle)
-    return config
 
 
 def check_map_identity(spec):

@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 
 from scripts.training.train_single import parse_args as parse_training_args, run_training
+from tools.experiment_config import assert_observation_contract, read_ini
 from tools.experiment_paths import TRAIN_RUNS_ROOT
 from tools.trainenv_instances import (
     DEFAULT_3D_EXE, DEFAULT_EDITOR, DEFAULT_EXE, DEFAULT_TEMPLATE, HOST,
@@ -14,7 +15,6 @@ from tools.trainenv_instances import (
 )
 from tools.ue_benchmark.ch4_stage3_crossing import CROSSING_MODES, crossing_mode, enable_crossing_clock
 from tools.ue_benchmark.ch4_stage3_v2_course import SPAWN_NED
-from tools.ue_benchmark.ch4_trainenv_3d_runtime import assert_observation_contract, read_ini
 
 
 TRAINENV_DYNAMIC_MAP = "/Game/UAVTraining/Maps/TrainEnv_Dynamic25"

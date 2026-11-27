@@ -7,9 +7,9 @@ from uuid import uuid4
 
 from scripts.evaluation.evaluate_single import main as evaluate
 from tools.airsim_instances import validate_ports_available
+from tools.experiment_config import assert_observation_contract, read_ini
 from tools.trainenv_instances import DEFAULT_EDITOR, HOST, _UnrealJob, _wait_ready
 from tools.ue_benchmark.ch4_trainenv_3d_course import ROOT, read_json, sha256, write_json
-from tools.ue_benchmark.ch4_trainenv_3d_runtime import assert_observation_contract, read_ini
 
 
 BASELINE = ROOT / "reports/ch4_benchmark_rebuild_20261125/eval_stage2_495k"

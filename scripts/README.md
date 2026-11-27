@@ -23,6 +23,7 @@ pixi run python -u -m scripts.training.train_trainenv --instances 4 --clock-spee
 默认读取 `configs/ch4_train_trainenv.ini`，共采集 300000 条环境转移，四实例每批采集 4 条。预算必须能整除实例数。
 入口从 `D:\UEBuilds\TrainEnv\Windows\TrainEnvAirSim.exe` 定位打包运行程序，以
 `--first-port`（默认 41771）起分配独立端口。RPC 确认四个实例都加载本次配置后才训练，退出时回收这批 UE 进程。
+使用源工程时，通过 `--ue-project` 指定 `.uproject`，需要覆盖可执行文件时使用 `--ue-exe`。
 
 每个实例使用独立的临时 settings，开启 `NoDisplay` 和 60 FPS 上限，只请求 320×180 的
 `DepthPlanar`。相机的深度捕获参数和 90×60 策略输入由原配置提供。可用
@@ -60,7 +61,7 @@ pixi run python -m scripts.evaluation.rebuild_summary `
 
 所有新训练输出写入 `Logs/TrainData`，所有新评估、筛选和诊断输出写入
 `Logs/EvaData`。目录规则见 [产物说明](../Logs/README.md)，原隧道批次沿用
-[复现协议](../RETRAINING.md)。历史 ENV4 筛选、评测与打包入口见 [归档](../archive/README.md)。
+[复现协议](../RETRAINING.md)。历史 ENV4 脚本保存在 Git 提交 `1a818ce` 的 `archive/` 中。
 
 `scripts/**/*.ps1`、`scripts.evaluation.record_parallel` 的窗口摆放，以及默认的
 `D:\UEBuilds\...` 与 `C:\Users\...` 路径都是 Windows 专用；`--dry-run` 计划生成
