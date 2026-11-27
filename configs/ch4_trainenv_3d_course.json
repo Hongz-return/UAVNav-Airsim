@@ -1,0 +1,67 @@
+{
+  "map": "/Game/UAVTraining/Maps/TrainEnv_3D",
+  "player_start_ue_cm": [0, 0, 120],
+  "interior_x_m": [-5, 72],
+  "floor_agl_m": 0,
+  "roof_agl_m": 6.4,
+  "wall_thickness_m": 0.4,
+  "lane_width_m": 12,
+  "families": {
+    "over": {
+      "lane_y_m": 0,
+      "start_agl_m": [1.35, 2.15],
+      "goal_agl_m": [1.45, 2.30],
+      "obstacles": [
+        {"name": "Over_FloorBlock", "maneuver": "over", "x_m": [24, 28], "z_agl_m": [0, 3.2]}
+      ],
+      "reference_xyz_agl_m": [[3, 0, 1.7], [19, 0, 4.25], [32, 0, 4.25], [56, 0, 1.8], [63, 0, 1.8]]
+    },
+    "under": {
+      "lane_y_m": 12,
+      "start_agl_m": [4.0, 4.8],
+      "goal_agl_m": [3.7, 4.65],
+      "obstacles": [
+        {"name": "Under_RoofBlock", "maneuver": "under", "x_m": [24, 28], "z_agl_m": [2.9, 6.4]}
+      ],
+      "reference_xyz_agl_m": [[3, 12, 4.4], [19, 12, 1.75], [33, 12, 1.75], [56, 12, 4.2], [63, 12, 4.2]]
+    },
+    "side": {
+      "lane_y_m": 24,
+      "start_agl_m": [1.5, 4.5],
+      "goal_agl_m": [1.5, 4.5],
+      "same_endpoint_altitude": true,
+      "obstacles": [
+        {"name": "Side_FullHeightBlock", "maneuver": "side", "x_m": [24, 28], "y_offset_m": [-2, 2], "z_agl_m": [0, 6.4]}
+      ],
+      "reference_xyz_agl_m": [[3, 24, 2.6], [19, 27.9, 2.6], [33, 27.9, 2.6], [52, 24, 2.6], [63, 24, 2.6]]
+    },
+    "over_under": {
+      "lane_y_m": 36,
+      "start_agl_m": [1.35, 2.15],
+      "goal_agl_m": [1.45, 2.35],
+      "obstacles": [
+        {"name": "Combo01_FloorBlock", "maneuver": "over", "x_m": [21, 24], "z_agl_m": [0, 3.35]},
+        {"name": "Combo02_RoofBlock", "maneuver": "under", "x_m": [43, 47], "z_agl_m": [2.75, 6.4]}
+      ],
+      "reference_xyz_agl_m": [[3, 36, 1.7], [17, 36, 4.3], [28, 36, 4.3], [39, 36, 1.7], [51, 36, 1.7], [64, 36, 2.0]]
+    }
+  },
+  "evaluation": {
+    "seed": 20261125,
+    "episodes_per_family": 10,
+    "start_x_m": [2, 5],
+    "goal_x_m": [60, 65],
+    "start_y_offset_m": [-0.85, 0.85],
+    "goal_y_offset_m": [-1.15, 1.15],
+    "yaw_offset_deg": [-10, 10],
+    "max_episode_steps": 500,
+    "accept_radius_m": 2.0,
+    "accept_altitude_tolerance_m": 0.5,
+    "clock_speed": 1.0,
+    "depth_shape_px": [180, 320],
+    "depth_max_encoding_m": 25,
+    "min_finite_positive_depth_fraction": 0.999,
+    "checkpoint_step": 495000,
+    "checkpoint_sha256": "ca88e0e6e3dbe419b3592ad9239e4c9c27228eff5e5aeb34f0367001e9e09b8d"
+  }
+}

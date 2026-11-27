@@ -7,7 +7,7 @@ import torch.nn as nn
 from gymnasium import spaces
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
-from .mamba_policy import CoordAttention2d
+from .vision import CoordAttention2d
 
 
 class FrameStackedDictExtractor(BaseFeaturesExtractor):
@@ -50,7 +50,6 @@ class FrameStackedDictExtractor(BaseFeaturesExtractor):
 
         n_stack, n_channels, height, width, image_layout = self._parse_image_shape(image_shape)
         self.n_stack = n_stack
-        self.n_channels = n_channels
         self.height = height
         self.width = width
         self.image_layout = image_layout

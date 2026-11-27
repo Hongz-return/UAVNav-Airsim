@@ -10,7 +10,6 @@ import threading
 
 # Windows API
 user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
 
 # Key codes
 VK_W, VK_S, VK_A, VK_D = 0x57, 0x53, 0x41, 0x44

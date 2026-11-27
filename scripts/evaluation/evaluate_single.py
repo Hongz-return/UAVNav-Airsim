@@ -20,11 +20,10 @@ import numpy as np
 from tools.runtime_support import apply_config_overrides, build_runtime_env, load_model
 from tools.experiment_paths import EVALUATION_RESULTS_ROOT, evaluation_parent_for_run
 
-DEFAULT_MODEL_PATH = "logs/Tunnel_Obs/Mamba"
 DEFAULT_EPISODES = 100
 
 
-def parse_args():
+def parse_args(argv=None):
     """Parse CLI args for evaluation."""
     parser = argparse.ArgumentParser(description="Evaluate trained UAV navigation model")
     parser.add_argument(
@@ -121,12 +120,53 @@ def parse_args():
             "(e.g. 2/4/6/8). seq_len=1 is equivalent to --no-history."
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--scene-config",
+        type=str,
+        default=None,
+        help="Optional .ini config overriding [environment], [scene], and [perception] for cross-scene evaluation",
+    )
+    return parser.parse_args(argv)
 
 
-def apply_evaluation_overrides(cfg, env_name=None, airsim_ip=None, airsim_port=None):
+def apply_evaluation_overrides(cfg, env_name=None, airsim_ip=None, airsim_port=None, scene_config=None):
     """Apply runtime-only evaluation overrides in memory."""
     apply_config_overrides(cfg, env_name_override=env_name)
+    if scene_config is not None:
+        if not os.path.exists(scene_config):
+            raise FileNotFoundError(f"Scene config not found: {scene_config}")
+        scene_cfg = ConfigParser()
+        scene_cfg.read(scene_config, encoding="utf-8")
+        if not scene_cfg.has_section("environment"):
+            raise ValueError(f"Scene config '{scene_config}' is missing [environment] section")
+        for key in ("max_depth_meters", "screen_height", "screen_width", "distance_norm_scale", "max_vertical_difference"):
+            if not scene_cfg.has_option("environment", key):
+                continue
+            fallback = 5.0 if key == "max_vertical_difference" else None
+            model_value = cfg.getfloat("environment", key, fallback=fallback)
+            if model_value is not None and not np.isclose(model_value, scene_cfg.getfloat("environment", key)):
+                raise ValueError(
+                    f"Incompatible scene config option environment.{key}: "
+                    f"model={model_value} vs scene={scene_cfg.get('environment', key)}"
+                )
+        for key, value in scene_cfg.items("environment"):
+            cfg.set("environment", key, value)
+        if not scene_cfg.has_option("environment", "training_routes"):
+            cfg.remove_option("environment", "training_routes")
+        if scene_cfg.has_section("scene"):
+            if not cfg.has_section("scene"):
+                cfg.add_section("scene")
+            for key, value in scene_cfg.items("scene"):
+                cfg.set("scene", key, value)
+        if not cfg.has_section("perception"):
+            cfg.add_section("perception")
+        if scene_cfg.has_section("perception"):
+            for key, value in scene_cfg.items("perception"):
+                cfg.set("perception", key, value)
+        if not scene_cfg.has_option("perception", "virtual_ceiling_prob"):
+            cfg.set("perception", "virtual_ceiling_prob", "0.0")
+    if (airsim_ip is not None or airsim_port is not None) and not cfg.has_section("airsim"):
+        cfg.add_section("airsim")
     if airsim_ip is not None:
         cfg.set("airsim", "ip", airsim_ip)
     if airsim_port is not None:
@@ -182,7 +222,7 @@ def build_evaluation_scenarios(
 
 def mean_or_none(values):
     """Return float mean or None when the list is empty."""
-    finite_values = [float(v) for v in values if np.isfinite(v)]
+    finite_values = [float(v) for v in values if v is not None and np.isfinite(v)]
     return float(np.mean(finite_values)) if finite_values else None
 
 
@@ -216,6 +256,8 @@ def build_summary(results):
         "avg_steps_success": mean_or_none(select(results["episode_steps"])),
         "avg_time_sec": mean_or_none(results["episode_times_sec"]),
         "avg_time_success_sec": mean_or_none(select(results["episode_times_sec"])),
+        "avg_nominal_control_time_sec": mean_or_none(results["nominal_control_times_sec"]),
+        "avg_state_timestamp_delta": mean_or_none(results["state_timestamp_deltas"]),
         "avg_speed_mps": mean_or_none(results["avg_speeds_mps"]),
         "avg_speed_success_mps": mean_or_none(select(results["avg_speeds_mps"])),
         "max_speed_mps": mean_or_none(results["max_speeds_mps"]),
@@ -402,6 +444,10 @@ def evaluate(model, env, num_episodes: int, use_history: bool = True):
         "mean_yaw_rate": [],
         "episode_steps": [],
         "episode_times_sec": [],
+        "nominal_control_times_sec": [],
+        "state_timestamp_starts": [],
+        "state_timestamp_ends": [],
+        "state_timestamp_deltas": [],
         "avg_speeds_mps": [],
         "max_speeds_mps": [],
         "min_obstacle_dists": [],
@@ -422,12 +468,15 @@ def evaluate(model, env, num_episodes: int, use_history: bool = True):
     action_dim = env.action_space.shape[-1]
     control_dt = float(getattr(base_env, "action_repeat", 1) * getattr(base_env.dynamic_model, "dt", 0.0))
     print(f"  [INFO] Direct control evaluation (action_dim={action_dim})")
-    print(f"  [INFO] Effective control interval: {control_dt:.3f}s")
+    print(f"  [INFO] Nominal action duration: {control_dt:.3f}s")
 
     # DummyVecEnv automatically resets after a terminal step. Reset once here,
     # then consume that auto-reset observation at the start of each next episode.
+    base_env.record_evaluation_timing = True
     obs = env.reset()
     for ep in range(num_episodes):
+        episode_start_wall = base_env.episode_start_wall_time
+        start_timestamp = base_env.episode_start_state_timestamp
         episode_scenario = dict(getattr(base_env, "current_scenario", None) or {})
         episode_reward = 0.0
         trajectory = []
@@ -488,12 +537,15 @@ def evaluate(model, env, num_episodes: int, use_history: bool = True):
             velocity = step_info.get("velocity")
             if velocity is not None and len(velocity) >= 3:
                 yaw_rate = abs(float(velocity[2]))
-                speed = float(np.linalg.norm(np.asarray(velocity[:2], dtype=np.float32)))
+                world_velocity = step_info.get('velocity_world')
+                if world_velocity is None:
+                    raise RuntimeError('Evaluation requires measured three-dimensional world velocity')
+                speed = float(np.linalg.norm(np.asarray(world_velocity, dtype=np.float32)))
             else:
                 try:
                     vel = base_env.dynamic_model.get_velocity()
                     yaw_rate = abs(vel[2])
-                    speed = float(np.linalg.norm(np.asarray(vel[:2], dtype=np.float32)))
+                    speed = float(np.linalg.norm(np.asarray(base_env.dynamic_model.last_velocity_world, dtype=np.float32)))
                 except Exception:
                     yaw_rate = 0.0
                     speed = 0.0
@@ -532,18 +584,24 @@ def evaluate(model, env, num_episodes: int, use_history: bool = True):
             denom = max(optimal_distance, path_length)
             spl = optimal_distance / denom if denom > 0 else 0.0
 
+        acts_np = np.asarray(actions)
         smoothness = 0.0
         if len(actions) > 1:
-            acts_np = np.array(actions)
             smoothness = float(np.mean(np.linalg.norm(acts_np[1:] - acts_np[:-1], axis=1) ** 2))
 
         control_effort = 0.0
         if actions:
-            acts_np = np.array(actions)
             control_effort = float(np.sum(np.linalg.norm(acts_np, axis=1) ** 2))
 
         episode_steps = int(info.get("step_num", len(actions)))
-        episode_time_sec = float(episode_steps * control_dt)
+        nominal_time_sec = float(episode_steps * control_dt)
+        episode_time_sec = float(info['wall_monotonic_time'] - episode_start_wall)
+        if episode_time_sec <= 0:
+            raise RuntimeError('Evaluation wall time must be positive')
+        end_timestamp = int(info['state_timestamp'])
+        timestamp_delta = end_timestamp - int(start_timestamp)
+        if timestamp_delta < 0:
+            raise RuntimeError('AirSim state timestamp moved backwards during an episode')
         avg_speed = float(path_length / episode_time_sec) if episode_time_sec > 0 else 0.0
         max_speed = float(np.max(speeds)) if speeds else 0.0
         min_obstacle_dist = float(np.min(obstacle_dists)) if obstacle_dists else float("inf")
@@ -563,6 +621,10 @@ def evaluate(model, env, num_episodes: int, use_history: bool = True):
         results["mean_yaw_rate"].append(mean_yaw)
         results["episode_steps"].append(episode_steps)
         results["episode_times_sec"].append(episode_time_sec)
+        results["nominal_control_times_sec"].append(nominal_time_sec)
+        results["state_timestamp_starts"].append(int(start_timestamp))
+        results["state_timestamp_ends"].append(end_timestamp)
+        results["state_timestamp_deltas"].append(timestamp_delta)
         results["avg_speeds_mps"].append(avg_speed)
         results["max_speeds_mps"].append(max_speed)
         results["min_obstacle_dists"].append(min_obstacle_dist)
@@ -589,13 +651,13 @@ def evaluate(model, env, num_episodes: int, use_history: bool = True):
     return results
 
 
-def main():
-    args = parse_args()
+def main(argv=None, *, runtime_config=None):
+    args = parse_args(argv)
 
     if not args.model_path:
         raise ValueError("Please provide --model_path (-m), e.g. logs/Tunnel/<run_name>")
 
-    config_file = os.path.join(args.model_path, "config", "config.ini")
+    config_file = runtime_config or os.path.join(args.model_path, "config", "config.ini")
     final_model_file = os.path.join(args.model_path, "models", "model_sb3.zip")
     best_model_file = os.path.join(args.model_path, "models", "best_model.zip")
     checkpoint_file = None
@@ -648,6 +710,7 @@ def main():
         env_name=args.env_name,
         airsim_ip=args.airsim_ip,
         airsim_port=args.airsim_port,
+        scene_config=args.scene_config,
     )
     env_name = cfg.get("options", "env_name")
     algo = cfg.get("options", "algo")
@@ -664,11 +727,14 @@ def main():
     print(f"Episodes: {args.episodes}")
     if args.no_history and args.inference_seq_len is not None and args.inference_seq_len > 1:
         raise ValueError("Cannot combine --no-history with --inference-seq-len > 1")
-    history_note = "enabled (Full)"
-    if args.no_history or (args.inference_seq_len is not None and args.inference_seq_len <= 1):
-        history_note = "DISABLED (Trunc / L=1)"
-    elif args.inference_seq_len is not None:
-        history_note = f"override L={args.inference_seq_len}"
+    effective_seq_len = 1 if args.no_history else args.inference_seq_len
+    use_history = effective_seq_len is None or effective_seq_len > 1
+    if not use_history:
+        history_mode, history_note = "trunc", "DISABLED (Trunc / L=1)"
+    elif effective_seq_len is None:
+        history_mode, history_note = "full", "enabled (Full)"
+    else:
+        history_mode, history_note = f"L{effective_seq_len}", f"override L={effective_seq_len}"
     print(f"History: {history_note}")
     print("-" * 70)
 
@@ -682,7 +748,6 @@ def main():
     if hasattr(model, "policy"):
         model.policy.set_training_mode(False)
 
-    use_history = not args.no_history
     if args.inference_seq_len is not None:
         actor = getattr(getattr(model, "policy", None), "actor", None)
         if actor is None or not hasattr(actor, "set_inference_seq_len"):
@@ -691,7 +756,6 @@ def main():
                 f"got {type(model).__name__}"
             )
         actor.set_inference_seq_len(args.inference_seq_len)
-        use_history = args.inference_seq_len > 1
         print(f"Actor inference_seq_len set to {actor.inference_seq_len}")
 
     if (not use_history) and "use_history" not in inspect.signature(model.predict).parameters:
@@ -723,9 +787,10 @@ def main():
     print(f"    Success Path Len:  {format_metric(summary['avg_path_length_success_m'], '.1f', ' m')}  (success only)")
     print(f"    Avg Steps:         {format_metric(summary['avg_steps'], '.1f')}")
     print(f"    Success Steps:     {format_metric(summary['avg_steps_success'], '.1f')}")
-    print(f"    Avg Time:          {format_metric(summary['avg_time_sec'], '.2f', ' s')}")
+    print(f"    Avg Wall Time:     {format_metric(summary['avg_time_sec'], '.2f', ' s')}")
+    print(f"    Avg Nominal Time:  {format_metric(summary['avg_nominal_control_time_sec'], '.2f', ' s')}")
     print(f"    Success Time:      {format_metric(summary['avg_time_success_sec'], '.2f', ' s')}")
-    print(f"    Avg Speed:         {format_metric(summary['avg_speed_mps'], '.2f', ' m/s')}")
+    print(f"    Avg Speed (wall):  {format_metric(summary['avg_speed_mps'], '.2f', ' m/s')}")
     print(f"    Success Speed:     {format_metric(summary['avg_speed_success_mps'], '.2f', ' m/s')}")
     print(f"    Max Speed:         {format_metric(summary['max_speed_mps'], '.2f', ' m/s')}")
     print(f"    Min Obs Dist:      {format_metric(summary['avg_min_obstacle_dist_m'], '.2f', ' m')}")
@@ -745,21 +810,7 @@ def main():
 
     if args.save:
         save_tag = args.save_tag or args.env_name
-        if args.no_history or (args.inference_seq_len is not None and args.inference_seq_len <= 1):
-            history_tag = "history_trunc"
-            history_mode = "trunc"
-            effective_seq_len = 1
-            use_history_saved = False
-        elif args.inference_seq_len is not None:
-            history_tag = f"history_L{args.inference_seq_len}"
-            history_mode = f"L{args.inference_seq_len}"
-            effective_seq_len = int(args.inference_seq_len)
-            use_history_saved = True
-        else:
-            history_tag = "history_full"
-            history_mode = "full"
-            effective_seq_len = None
-            use_history_saved = True
+        history_tag = f"history_{history_mode}"
         if history_tag not in str(save_tag):
             save_tag = f"{save_tag}_{history_tag}" if save_tag else history_tag
 
@@ -788,12 +839,16 @@ def main():
             "episodes": args.episodes,
             "environment": env_name,
             "algorithm": algo,
-            "use_history": use_history_saved,
+            "use_history": use_history,
             "history_mode": history_mode,
             "inference_seq_len": effective_seq_len,
             "scenario_seed": args.scenario_seed,
             "yaw_range_deg": args.yaw_range_deg,
             "scenario_manifest_source": scenario_manifest_source,
+            "time_metric": "wall time from post-reset observation to terminal step; excludes auto-reset",
+            "nominal_time_metric": "number of actions times commanded action duration",
+            "state_timestamp_metric": "raw AirSim MultirotorState timestamp; units and clock semantics unverified",
+            "speed_metric": "3D path distance / wall time; max is sampled 3D world velocity",
         }
         with open(
             os.path.join(eval_dir, "evaluation_manifest.json"),
@@ -827,6 +882,10 @@ def main():
                 "mean_yaw_rate": results["mean_yaw_rate"],
                 "episode_steps": results["episode_steps"],
                 "episode_times_sec": results["episode_times_sec"],
+                "nominal_control_times_sec": results["nominal_control_times_sec"],
+                "state_timestamp_starts": results["state_timestamp_starts"],
+                "state_timestamp_ends": results["state_timestamp_ends"],
+                "state_timestamp_deltas": results["state_timestamp_deltas"],
                 "avg_speeds_mps": results["avg_speeds_mps"],
                 "max_speeds_mps": results["max_speeds_mps"],
                 "min_obstacle_dists": results["min_obstacle_dists"],
@@ -862,6 +921,7 @@ def main():
         print("  terminal_events.csv + *_points.csv - terminal markers for plotting")
         print("  summary_metrics.json/.csv - paper-ready aggregate metrics")
         print("  evaluation_manifest.json - evaluated model and history protocol")
+        return eval_dir
 
 
 if __name__ == "__main__":

@@ -25,7 +25,6 @@ class BasePerception(ABC):
             cfg: ConfigParser with perception parameters
             client: AirSim client for image acquisition
         """
-        self.cfg = cfg
         self.client = client
         self._load_config(cfg)
 
@@ -44,6 +43,10 @@ class BasePerception(ABC):
         except (configparser.NoSectionError, configparser.NoOptionError):
             self.camera_id = "0"
 
+    def reset(self, *, rng=None, disable_augmentation=False) -> None:
+        """Reset episode-local perception state."""
+        pass
+
     @abstractmethod
     def get_observation_space(self) -> spaces.Space:
         """
@@ -55,12 +58,15 @@ class BasePerception(ABC):
         pass
 
     @abstractmethod
-    def get_observation(self, state_feature: np.ndarray = None) -> np.ndarray:
+    def get_observation(
+        self, state_feature: np.ndarray = None, *, dz_above_start: float | None = None
+    ) -> np.ndarray:
         """
         Get observation from sensors.
 
         Args:
             state_feature: Optional state features to concatenate
+            dz_above_start: ENU altitude change from the start, when augmentation is allowed
 
         Returns:
             Observation array matching observation_space

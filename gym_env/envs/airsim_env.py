@@ -3,12 +3,13 @@ AirSim Gym environment for UAV navigation.
 """
 
 import ast
+import time
 
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from .dynamics.multirotor_airsim import MultirotorDynamicsAirsim
+from .dynamics.multirotor_airsim import MultirotorDynamicsAirsim, step_state_reads
 from .perception import get_perception
 from .tasks import get_task
 
@@ -26,19 +27,23 @@ class AirsimGymEnv(gym.Env):
 
         self.task = None
         self.perception = None
+        self.training_routes = []
+        self.stage3_course = None
+        self.print_airsim_log = False
         # Evaluation-only switch: keep episodes alive after collision events
         # and let the evaluator aggregate collision statistics separately.
         self.continue_after_collision = False
         self._evaluation_scenarios = None
         self._evaluation_scenario_index = 0
         self.current_scenario = None
+        self.record_evaluation_timing = False
 
     def set_config(self, cfg):
         """Configure environment from .ini config file."""
-        self.cfg = cfg
         self.env_name = cfg.get("options", "env_name")
         self.dynamic_name = cfg.get("options", "dynamic_name")
         self.perception_type = cfg.get("options", "perception")
+        self.print_airsim_log = cfg.getboolean("options", "print_airsim_log", fallback=False)
         reward_type = cfg.get("options", "reward_type", fallback="reward_final")
         use_pid_residual = cfg.getboolean("options", "use_pid_residual", fallback=False)
 
@@ -57,12 +62,13 @@ class AirsimGymEnv(gym.Env):
         self.dynamic_model = MultirotorDynamicsAirsim(cfg)
         self.client = self.dynamic_model.client
         self.state_feature_length = self.dynamic_model.state_feature_length
+        self.action_space = self.dynamic_model.action_space
 
         self._load_environment_config(cfg)
 
         perception_cls = get_perception(self.perception_type)
         self.perception = perception_cls(cfg, self.client)
-        if self.perception_type in ["vector", "depth_state"]:
+        if self.perception_type in ["vector", "depth_state", "depth_motion"]:
             self.perception.set_state_feature_length(self.state_feature_length)
         self.observation_space = self.perception.get_observation_space()
         obs_desc = getattr(self.observation_space, "shape", self.observation_space)
@@ -76,12 +82,12 @@ class AirsimGymEnv(gym.Env):
         self.total_step = 0
         self.step_num = 0
         self.cumulated_episode_reward = 0
+        self._episode_reward_components = {}
         self.previous_distance_from_des_point = 0
         self.min_distance_to_obstacles = float("inf")
 
         self.max_episode_steps = cfg.getint("environment", "max_episode_steps")
         self.action_repeat = cfg.getint("multirotor", "action_repeat", fallback=1)
-        self.action_space = self.dynamic_model.action_space
 
         print(f"  Action repeat: {self.action_repeat} (each action lasts {self.action_repeat * self.dynamic_model.dt:.2f}s)")
 
@@ -91,9 +97,12 @@ class AirsimGymEnv(gym.Env):
 
         start_position = parse(cfg.get("environment", "start_position"))
         goal_position = parse(cfg.get("environment", "goal_position"))
-        start_random_angle = cfg.getfloat("environment", "start_random_angle")
+        self.start_random_angle = cfg.getfloat("environment", "start_random_angle")
+        self.random_route_reverse = cfg.getboolean("environment", "random_route_reverse", fallback=False)
+        routes = cfg.get("environment", "training_routes", fallback=None)
+        self.training_routes = self._parse_training_routes(routes) if routes and routes.strip() else []
 
-        self.dynamic_model.set_start(start_position, random_angle=start_random_angle)
+        self.dynamic_model.set_start(start_position, random_angle=self.start_random_angle)
         self.dynamic_model._set_goal_pose_single(goal_position)
 
         self.work_space_x = parse(cfg.get("environment", "work_space_x"))
@@ -103,27 +112,74 @@ class AirsimGymEnv(gym.Env):
         print(f"  Start: {start_position}, Goal: {goal_position}")
         print(f"  Workspace X: {self.work_space_x}, Y: {self.work_space_y}, Z: {self.work_space_z}")
 
+    @staticmethod
+    def _parse_training_routes(routes_config):
+        try:
+            routes = ast.literal_eval(routes_config)
+        except (ValueError, SyntaxError) as error:
+            raise ValueError("environment.training_routes must be a list of routes") from error
+        if not isinstance(routes, list) or not routes:
+            raise ValueError("environment.training_routes must be a non-empty list")
+
+        parsed = []
+        for route in routes:
+            if isinstance(route, dict):
+                route = (route.get("start"), route.get("goal"))
+            if not isinstance(route, (list, tuple)) or len(route) != 2 or not all(
+                isinstance(point, (list, tuple)) and len(point) == 3
+                and all(isinstance(coordinate, (int, float)) and not isinstance(coordinate, bool) for coordinate in point)
+                for point in route
+            ):
+                raise ValueError("Each training route needs a start and a goal with three numeric coordinates each")
+            start, goal = route
+            parsed.append((start, goal))
+        return parsed
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
         self._apply_next_evaluation_scenario()
+        route_idx = None
+        route_reversed = False
+        if self.stage3_course is not None and self._evaluation_scenarios is None:
+            self.stage3_course.select_route(self)
+        elif self._evaluation_scenarios is None and self.training_routes:
+            route_idx = int(self.np_random.integers(len(self.training_routes)))
+            start, goal = self.training_routes[route_idx]
+            if self.random_route_reverse:
+                route_reversed = bool(self.np_random.integers(2))
+                if route_reversed:
+                    start, goal = goal, start
+            self.dynamic_model.set_start(start, random_angle=self.start_random_angle, fixed_yaw=None)
+            self.dynamic_model._set_goal_pose_single(goal)
         self.dynamic_model.reset(rng=self.np_random)
         self.episode_num += 1
         self.step_num = 0
         self.cumulated_episode_reward = 0
+        self._episode_reward_components = {}
         self.dynamic_model.goal_distance = self.dynamic_model.get_distance_to_goal_3d()
         self.previous_distance_from_des_point = self.dynamic_model.goal_distance
 
         if self.task:
             self.task.reset()
 
+        disable_augmentation = self._evaluation_scenarios is not None or (
+            self.stage3_course is not None and self.stage3_course.disable_virtual_ceiling
+        )
+        self.perception.reset(rng=self.np_random, disable_augmentation=disable_augmentation)
         obs = self._get_obs()
+        if self.record_evaluation_timing:
+            self.dynamic_model.get_velocity()
+            self.episode_start_state_timestamp = self.dynamic_model.last_state_timestamp
+            self.episode_start_wall_time = time.perf_counter()
         return obs, {
             "scenario_id": (
                 self.current_scenario.get("scenario_id")
                 if self.current_scenario is not None
                 else None
-            )
+            ),
+            "route_index": route_idx,
+            "route_reversed": route_reversed,
         }
 
     def set_evaluation_scenarios(self, scenarios):
@@ -151,40 +207,40 @@ class AirsimGymEnv(gym.Env):
 
     def _execute_action(self, action):
         """Execute the policy action directly."""
+        if self.stage3_course is not None and self._evaluation_scenarios is None:
+            action = self.stage3_course.training_action(action)
         self.dynamic_model.set_action(action)
         return action
 
     def step(self, action):
         """Execute action, optionally with action_repeat for smoother control."""
         self.step_num += 1
-        if self.action_repeat <= 1:
+        reward_components = {}
+        reward = 0.0
+        repeats = max(1, self.action_repeat)
+        for substep in range(repeats):
             actual_action = self._execute_action(action)
-            obs = self._get_obs()
-            done = self.task.is_done()
-            reward = self.task.compute_reward(done, actual_action)
-            self.cumulated_episode_reward += reward
-            self.total_step += 1
-            info = self.task.get_info()
-        else:
-            total_reward = 0.0
-            actual_action = None
-            for _ in range(self.action_repeat):
-                actual_action = self._execute_action(action)
+            with step_state_reads(self.dynamic_model):
                 obs = self._get_obs()
                 done = self.task.is_done()
-                reward = self.task.compute_reward(done, actual_action)
-                total_reward += reward
-                self.cumulated_episode_reward += reward
+                step_reward = self.task.compute_reward(done, actual_action)
+                for name, value in self.task.last_reward_components.items():
+                    reward_components[name] = reward_components.get(name, 0.0) + value
+                reward += step_reward
+                self.cumulated_episode_reward += step_reward
                 self.total_step += 1
                 info = self.task.get_info()
-                if done:
+                if done or substep + 1 == repeats:
+                    info["actual_action"] = actual_action
+                    if (self.stage3_course is not None and self._evaluation_scenarios is None
+                            and self.stage3_course.used_guidance):
+                        info["stage3_guided_action"] = actual_action
+                    info["position"] = list(self.dynamic_model.get_position())
+                    info["velocity"] = list(self.dynamic_model.get_velocity())
+                    info["velocity_world"] = list(self.dynamic_model.last_velocity_world)
+                    info["state_timestamp"] = self.dynamic_model.last_state_timestamp
+                    info["min_distance_to_obstacles"] = float(self.min_distance_to_obstacles)
                     break
-            reward = total_reward
-
-        info["actual_action"] = actual_action
-        info["position"] = list(self.dynamic_model.get_position())
-        info["velocity"] = list(self.dynamic_model.get_velocity())
-        info["min_distance_to_obstacles"] = float(self.min_distance_to_obstacles)
 
         terminated = done
         if self.continue_after_collision and info.get("is_crash", False):
@@ -202,18 +258,33 @@ class AirsimGymEnv(gym.Env):
                 reward += timeout_reward
                 self.cumulated_episode_reward += timeout_reward
                 info["timeout_reward"] = timeout_reward
+                reward_components['timeout'] = reward_components.get('timeout', 0.0) + timeout_reward
             info["TimeLimit.truncated"] = True
 
-        if self.step_num % 10 == 0:
+        info['reward_components'] = reward_components
+        for name, value in reward_components.items():
+            self._episode_reward_components[name] = self._episode_reward_components.get(name, 0.0) + value
+        if terminated or truncated:
+            info['episode_reward_components'] = dict(self._episode_reward_components)
+            if self.stage3_course is not None and self._evaluation_scenarios is None:
+                info["stage3_episode"] = self.stage3_course.terminal_metrics(info, truncated)
+
+        if self.print_airsim_log and self.step_num % 10 == 0:
             self.client.simPrintLogMessage("Train: ", f"EP:{self.episode_num} Step:{self.step_num}")
             self.client.simPrintLogMessage("Reward: ", f"{reward:.3f} total:{self.cumulated_episode_reward:.3f}")
+
+        if self.record_evaluation_timing:
+            info['wall_monotonic_time'] = time.perf_counter()
 
         return obs, reward, terminated, truncated, info
 
     def _get_obs(self):
         """Get observation from perception module."""
         state_feature = self.dynamic_model._get_state_feature()
-        obs = self.perception.get_observation(state_feature)
+        dz_above_start = (
+            self.dynamic_model.state_altitude_above_start if self._evaluation_scenarios is None else None
+        )
+        obs = self.perception.get_observation(state_feature, dz_above_start=dz_above_start)
         self.min_distance_to_obstacles = self.perception.min_distance_to_obstacles
 
         if isinstance(self.observation_space, spaces.Dict):

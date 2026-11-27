@@ -2,6 +2,8 @@
 Sequence Replay Buffer for Mamba-based RL.
 Stores complete episodes and samples continuous trajectory segments.
 """
+from bisect import bisect_left
+
 import numpy as np
 import torch
 from typing import Dict, List, Optional, Tuple, Union
@@ -19,6 +21,7 @@ class EpisodeStorage:
         self.terminateds: List[bool] = []  # True termination (crash/success/outside)
         self.final_obs: Optional[Dict[str, np.ndarray]] = None  # For truncated episodes
         self.length = 0
+        self.terminal_reward: Optional[float] = None
 
     def add(self, obs: Dict[str, np.ndarray], action: np.ndarray,
             reward: float, terminated: bool):
@@ -40,47 +43,63 @@ class EpisodeStorage:
         """Set the final observation for truncated episodes (needed for bootstrap)."""
         self.final_obs = final_obs
 
-    def get_sequence(self, start_idx: int, seq_len: int) -> Dict:
-        """Get a sequence starting from start_idx."""
-        end_idx = min(start_idx + seq_len, self.length)
-        actual_len = end_idx - start_idx
+    def get_state(self) -> Dict:
+        data = dict(observations=self.observations, actions=self.actions, rewards=self.rewards,
+                    terminateds=self.terminateds, final_obs=self.final_obs, length=self.length)
+        if self.terminal_reward is not None:
+            data['terminal_reward'] = self.terminal_reward
+        return data
 
-        # Stack observations
-        obs_seq = {
-            key: np.stack([self.observations[i][key] for i in range(start_idx, end_idx)])
-            for key in self.observations[0].keys()
+    @classmethod
+    def from_state(cls, data: Dict):
+        episode = cls()
+        episode.observations = data['observations']
+        episode.actions = data['actions']
+        episode.rewards = data['rewards']
+        episode.terminateds = data['terminateds']
+        episode.final_obs = data['final_obs']
+        episode.length = data['length']
+        episode.terminal_reward = data.get('terminal_reward')
+        return episode
+
+    def read_context(self, start: int, end: int, history: int, right_pad: int):
+        """Read H-1 prefix frames, the segment and its bootstrap frame."""
+        first = max(0, start - history + 1)
+        frames = self.observations[first:end]
+        if end < self.length:
+            next_frame = self.observations[end]
+        else:
+            next_frame = self.final_obs if self.final_obs is not None else frames[-1]
+
+        # Left-pad a short history with the first frame. Beyond a real segment,
+        # context repeats its bootstrap frame, including at a timeout.
+        padding = history - 1 - (start - first)
+        frames = [frames[0]] * padding + frames + [next_frame] * (1 + right_pad)
+        return {key: np.stack([frame[key] for frame in frames]) for key in frames[0]}
+
+    def get_sequence(self, start_idx: int, seq_len: int, history_len: Optional[int] = None) -> Dict:
+        """Read one episode-local segment, including its final bootstrap frame."""
+        history = 1 if history_len is None else history_len
+        if history < 1:
+            raise ValueError('history_len must be positive')
+        end = min(start_idx + seq_len, self.length)
+        length = end - start_idx
+        context = self.read_context(start_idx, end, history, 0 if history_len is None else seq_len - length)
+        current = slice(history - 1, history - 1 + length)
+        following = slice(history, history + length)
+        result = {
+            'observations': {k: v[current].copy() for k, v in context.items()},
+            'next_observations': {k: v[following].copy() for k, v in context.items()},
+            'actions': np.stack(self.actions[start_idx:end]),
+            'rewards': np.asarray(self.rewards[start_idx:end]),
+            'dones': np.asarray(self.terminateds[start_idx:end]),
+            'seq_len': length,
         }
-
-        # Stack actions, rewards, terminateds
-        actions = np.stack(self.actions[start_idx:end_idx])
-        rewards = np.array(self.rewards[start_idx:end_idx])
-        terminateds = np.array(self.terminateds[start_idx:end_idx])
-
-        # Next observations (shifted by 1)
-        # For the last step, use final_obs if available (truncated episode), else use last obs
-        def get_next_obs(i, key):
-            if i + 1 < self.length:
-                return self.observations[i + 1][key]
-            elif self.final_obs is not None:
-                # Truncated episode: use stored final_obs for bootstrap
-                return self.final_obs[key]
-            else:
-                # Terminated episode: use last obs (won't be used due to done=True)
-                return self.observations[self.length - 1][key]
-
-        next_obs_seq = {
-            key: np.stack([get_next_obs(i, key) for i in range(start_idx, end_idx)])
-            for key in self.observations[0].keys()
-        }
-
-        return {
-            'observations': obs_seq,
-            'actions': actions,
-            'rewards': rewards,
-            'dones': terminateds,  # Only true terminations, not truncations
-            'next_observations': next_obs_seq,
-            'seq_len': actual_len,
-        }
+        if history_len is not None:
+            result['context_observations'] = context
+            steps = np.minimum(np.arange(seq_len) + start_idx + 1, end)
+            result['history_lengths'] = np.minimum(steps, history)
+        return result
 
 
 class SequenceReplayBuffer:
@@ -107,7 +126,7 @@ class SequenceReplayBuffer:
         self.observation_space = observation_space
         self.action_space = action_space
         self.seq_len = seq_len
-        self.n_envs = n_envs
+        self.n_envs = max(1, int(n_envs))
 
         if device == "auto":
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -116,7 +135,7 @@ class SequenceReplayBuffer:
 
         # Episode storage
         self.episodes: deque = deque()
-        self.current_episode: Optional[EpisodeStorage] = None
+        self._active_episodes: List[Optional[EpisodeStorage]] = [None] * self.n_envs
         self.total_transitions = 0
 
         # Index for efficient sampling: (episode_idx, start_idx) pairs
@@ -124,6 +143,14 @@ class SequenceReplayBuffer:
         self.valid_starts: List[Tuple[int, int]] = []
         self._next_ep_idx = 0        # Global Episode counter (never resets)
         self._min_valid_ep_idx = 0   # Lowest ep_idx still alive in deque
+
+    @property
+    def current_episode(self) -> Optional[EpisodeStorage]:
+        return self._active_episodes[0]
+
+    @current_episode.setter
+    def current_episode(self, episode: Optional[EpisodeStorage]) -> None:
+        self._active_episodes[0] = episode
 
     def add(
         self,
@@ -133,6 +160,7 @@ class SequenceReplayBuffer:
         reward: float,
         done: bool,
         infos: Optional[Dict] = None,
+        env_idx: int = 0,
     ):
         """
         Add a transition to the buffer.
@@ -145,38 +173,45 @@ class SequenceReplayBuffer:
             done: True ONLY for true terminations (crash/success/outside).
                   False for truncations (timeout) - allows Critic to bootstrap.
             infos: Must contain 'TimeLimit.truncated' for truncated episodes.
+            env_idx: Environment that produced this transition.
 
         Episode boundary handling:
         - True termination (done=True): episode ends, no bootstrap (next_obs not needed)
         - Truncation (TimeLimit.truncated=True): episode ends, next_obs stored for bootstrap
         """
-        # Start new episode if needed
-        if self.current_episode is None:
-            self.current_episode = EpisodeStorage()
+        if not 0 <= env_idx < self.n_envs:
+            raise IndexError(f"Invalid replay environment index: {env_idx}")
+        episode = self._active_episodes[env_idx]
+        if episode is None:
+            episode = self._active_episodes[env_idx] = EpisodeStorage()
 
         # Check if this is a truncation (timeout) - episode ends but allows bootstrap
         truncated = infos.get('TimeLimit.truncated', False) if infos else False
 
         # Add transition
         # done=True only for true terminations, False for truncations (allows bootstrap)
-        self.current_episode.add(obs, action, reward, done)
+        episode.add(obs, action, reward, done)
         self.total_transitions += 1
 
         # End episode on ANY done condition (termination OR truncation)
         # This prevents multiple episodes from being concatenated
         episode_ended = done or truncated
         if episode_ended:
+            # With action_repeat the transition reward may include earlier dense rewards.
+            terminal = (infos or {}).get('reward_components', {}).get('terminal')
+            if done and terminal is not None and terminal != reward:
+                episode.terminal_reward = float(terminal)
             # For truncated episodes, store next_obs for proper bootstrap
             if truncated and not done:
-                self.current_episode.set_final_obs(next_obs)
-            self._finish_episode()
+                episode.set_final_obs(next_obs)
+            self._finish_episode(env_idx)
 
         # Safety: force finish if current episode is too long (prevents memory issues)
         # This shouldn't happen with proper TimeLimit wrapper, but adds robustness
         max_episode_len = min(self.buffer_size // 2, 10000)  # Cap at half buffer or 10k steps
-        if self.current_episode is not None and self.current_episode.length >= max_episode_len:
+        if not episode_ended and episode.length >= max_episode_len:
             print(f"Warning: Episode exceeded {max_episode_len} steps, forcing finish")
-            self._finish_episode()
+            self._finish_episode(env_idx)
 
         # Remove old episodes if over capacity
         while self.total_transitions > self.buffer_size and len(self.episodes) > 1:
@@ -184,27 +219,30 @@ class SequenceReplayBuffer:
             self.total_transitions -= removed.length
             self._min_valid_ep_idx += 1
 
-    def _finish_episode(self):
-        """Finish current episode and add to buffer."""
-        if self.current_episode is not None and self.current_episode.length > 0:
+    def _finish_episode(self, env_idx: int = 0):
+        """Finish an environment's active episode and make it available to sample."""
+        if not 0 <= env_idx < self.n_envs:
+            raise IndexError(f"Invalid replay environment index: {env_idx}")
+        self._store_episode(self._active_episodes[env_idx])
+        self._active_episodes[env_idx] = None
+
+    def _store_episode(self, episode: Optional[EpisodeStorage]) -> None:
+        if episode is not None and episode.length > 0:
             ep_idx = self._next_ep_idx
             self._next_ep_idx += 1
-            self.episodes.append(self.current_episode)
-            # Register valid starting positions with global ep_idx
-            for start in range(self.current_episode.length):
+            self.episodes.append(episode)
+            for start in range(episode.length):
                 self.valid_starts.append((ep_idx, start))
-        self.current_episode = None
 
-    def _compact_valid_starts(self):
-        """Remove stale entries (lazy compaction)."""
-        self.valid_starts = [
-            (ei, si) for ei, si in self.valid_starts
-            if ei >= self._min_valid_ep_idx
-        ]
-
-    def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
+    def sample(self, batch_size: int, history_len: int = 8, *,
+               compact: bool = False, failure_horizon: Optional[int] = None,
+               failure_rewards: Tuple[float, float] = (-25.0, -20.0),
+               include_episode_indices: bool = False,
+               demo_prefix: Optional[Tuple[int, float]] = None) -> Dict[str, torch.Tensor]:
         """
-        Sample a batch of sequences.
+        Sample a batch of sequences. Training can request compact=True to
+        transfer one native-dtype context and keep grouping lengths on CPU.
+        The default returns independent float32 observation batches.
 
         Returns:
             Dict with:
@@ -214,94 +252,113 @@ class SequenceReplayBuffer:
             - dones: (batch, seq_len)
             - next_observations: Dict[str, Tensor] with shape (batch, seq_len, ...)
             - mask: (batch, seq_len) - 1 for valid, 0 for padded
+            - context_observations: (batch, history_len + seq_len, ...)
+            - history_lengths: (batch, seq_len), actual episode-local history
+            - failure_targets, failure_mask: optional finite-horizon labels
+            - episode_indices, steps_remaining: optional replay episode identities and positions
         """
-        if len(self.valid_starts) == 0:
+        if failure_horizon is not None and failure_horizon < 1:
+            raise ValueError("failure_horizon must be positive")
+        if history_len < 1:
+            raise ValueError('history_len must be positive')
+        # Completed episodes append starts in order. Evictions leave a stale
+        # prefix. Keep the original population order and NumPy RNG draws.
+        first_live = bisect_left(self.valid_starts, (self._min_valid_ep_idx,))
+        if len(self.valid_starts) > 2 * self.total_transitions:
+            del self.valid_starts[:first_live]
+            first_live = 0
+        population = len(self.valid_starts) - first_live
+        if not population:
             raise ValueError("No valid data in buffer")
+        if demo_prefix is None:
+            indices = np.random.choice(population, batch_size, replace=population < batch_size)
+        else:
+            end, fraction = demo_prefix
+            demonstrations = bisect_left(self.valid_starts, (end,), first_live) - first_live
+            online = population - demonstrations
+            if not demonstrations or not online:
+                indices = np.random.choice(population, batch_size, replace=population < batch_size)
+            else:
+                demo_count = round(batch_size * fraction)
+                regular_count = batch_size - demo_count
+                indices = np.concatenate((
+                    np.random.choice(demonstrations, demo_count, replace=demonstrations < demo_count),
+                    demonstrations + np.random.choice(online, regular_count, replace=online < regular_count),
+                ))
+                np.random.shuffle(indices)
 
-        # Lazy compaction: purge stale entries periodically
-        if self._min_valid_ep_idx > 0 and len(self.valid_starts) > 2 * self.total_transitions:
-            self._compact_valid_starts()
+        shape = (batch_size, self.seq_len)
 
-        # Filter valid entries on-the-fly during sampling
-        live_starts = [
-            (ei, si) for ei, si in self.valid_starts
-            if ei >= self._min_valid_ep_idx
-        ]
-        if len(live_starts) == 0:
-            raise ValueError("No valid data in buffer after filtering")
+        def observation_batch(steps, native=False):
+            return {key: np.empty((batch_size, steps, *space.shape), space.dtype if native else np.float32)
+                    for key, space in self.observation_space.spaces.items()}
 
-        replace = len(live_starts) < batch_size
-        indices = np.random.choice(len(live_starts), batch_size, replace=replace)
+        if not compact:
+            observations = observation_batch(self.seq_len)
+            next_observations = observation_batch(self.seq_len)
+        context = observation_batch(history_len + self.seq_len, native=compact)
+        actions = np.zeros((*shape, *self.action_space.shape), np.float32)
+        rewards = np.zeros(shape, np.float32)
+        dones = np.ones(shape, np.float32)
+        mask = np.zeros(shape, np.float32)
+        lengths = np.empty(shape, np.int64)
+        if include_episode_indices:
+            episode_indices = np.empty(batch_size, np.int64)
+            steps_remaining = np.zeros(shape, np.int64)
+        if failure_horizon is not None:
+            failure_targets = np.zeros((*shape, len(failure_rewards)), np.float32)
+            failure_mask = np.zeros(shape, np.float32)
 
-        batch_obs = {key: [] for key in self.observation_space.spaces.keys()}
-        batch_next_obs = {key: [] for key in self.observation_space.spaces.keys()}
-        batch_actions = []
-        batch_rewards = []
-        batch_dones = []
-        batch_masks = []
+        for row, index in enumerate(indices):
+            ep_idx, start_idx = self.valid_starts[first_live + index]
+            if include_episode_indices:
+                episode_indices[row] = ep_idx
+            episode = self.episodes[ep_idx - self._min_valid_ep_idx]
+            end = min(start_idx + self.seq_len, episode.length)
+            actual_len = end - start_idx
+            valid = slice(0, actual_len)
+            if include_episode_indices:
+                steps_remaining[row, valid] = episode.length - (start_idx + np.arange(actual_len))
+            frames = episode.read_context(start_idx, end, history_len, self.seq_len - actual_len)
+            for key, sequence in frames.items():
+                context[key][row] = sequence
+                if compact:
+                    continue
+                current = sequence[history_len - 1:history_len - 1 + actual_len]
+                observations[key][row, valid] = current
+                observations[key][row, actual_len:] = current[-1]
+                next_observations[key][row] = sequence[history_len:]
+            steps = np.minimum(np.arange(self.seq_len) + start_idx + 1, end)
+            lengths[row] = np.minimum(steps, history_len)
+            actions[row, valid] = episode.actions[start_idx:end]
+            rewards[row, valid] = episode.rewards[start_idx:end]
+            dones[row, valid] = episode.terminateds[start_idx:end]
+            mask[row, valid] = 1
+            if failure_horizon is not None:
+                remaining = episode.length - (start_idx + np.arange(actual_len))
+                ended = bool(episode.terminateds[-1])
+                terminal = episode.terminal_reward
+                if terminal is None:
+                    terminal = episode.rewards[-1]
+                types = np.asarray(failure_rewards) == terminal
+                failure_targets[row, valid] = (remaining <= failure_horizon)[:, None] & types & ended
+                # A timeout censors horizons beyond the observed prefix.
+                failure_mask[row, valid] = ended | (remaining >= failure_horizon)
 
-        for idx in indices:
-            ep_idx, start_idx = live_starts[idx]
-            # Map global ep_idx to deque position
-            deque_pos = ep_idx - self._min_valid_ep_idx
-            episode = self.episodes[deque_pos]
+        def tensors(arrays):
+            return {key: torch.as_tensor(value, device=self.device) for key, value in arrays.items()}
 
-            seq_data = episode.get_sequence(start_idx, self.seq_len)
-            actual_len = seq_data['seq_len']
-
-            # Pad if necessary
-            pad_len = self.seq_len - actual_len
-
-            for key in batch_obs.keys():
-                obs_seq = seq_data['observations'][key]
-                next_obs_seq = seq_data['next_observations'][key]
-
-                if pad_len > 0:
-                    # Pad with last observation
-                    pad_shape = (pad_len,) + obs_seq.shape[1:]
-                    obs_pad = np.broadcast_to(obs_seq[-1:], pad_shape)
-                    next_obs_pad = np.broadcast_to(next_obs_seq[-1:], pad_shape)
-                    obs_seq = np.concatenate([obs_seq, obs_pad], axis=0)
-                    next_obs_seq = np.concatenate([next_obs_seq, next_obs_pad], axis=0)
-
-                batch_obs[key].append(obs_seq)
-                batch_next_obs[key].append(next_obs_seq)
-
-            # Pad actions, rewards, terminateds
-            actions = seq_data['actions']
-            rewards = seq_data['rewards']
-            terminateds = seq_data['dones']  # Only true terminations
-
-            if pad_len > 0:
-                actions = np.concatenate([actions, np.zeros((pad_len,) + actions.shape[1:])], axis=0)
-                rewards = np.concatenate([rewards, np.zeros(pad_len)], axis=0)
-                # Padded positions are treated as terminated (no bootstrap)
-                terminateds = np.concatenate([terminateds, np.ones(pad_len, dtype=bool)], axis=0)
-
-            batch_actions.append(actions)
-            batch_rewards.append(rewards)
-            batch_dones.append(terminateds)
-
-            # Mask: 1 for valid, 0 for padded
-            mask = np.concatenate([np.ones(actual_len), np.zeros(pad_len)])
-            batch_masks.append(mask)
-
-        # Stack and convert to tensors
-        result = {
-            'observations': {
-                key: torch.tensor(np.stack(batch_obs[key]), dtype=torch.float32, device=self.device)
-                for key in batch_obs.keys()
-            },
-            'next_observations': {
-                key: torch.tensor(np.stack(batch_next_obs[key]), dtype=torch.float32, device=self.device)
-                for key in batch_next_obs.keys()
-            },
-            'actions': torch.tensor(np.stack(batch_actions), dtype=torch.float32, device=self.device),
-            'rewards': torch.tensor(np.stack(batch_rewards), dtype=torch.float32, device=self.device),
-            'dones': torch.tensor(np.stack(batch_dones), dtype=torch.float32, device=self.device),
-            'mask': torch.tensor(np.stack(batch_masks), dtype=torch.float32, device=self.device),
-        }
-
+        result = tensors({'actions': actions, 'rewards': rewards, 'dones': dones,
+                          'mask': mask})
+        result['history_lengths'] = torch.as_tensor(lengths, device='cpu' if compact else self.device)
+        result['context_observations'] = tensors(context)
+        if include_episode_indices:
+            result['episode_indices'] = torch.as_tensor(episode_indices, device=self.device)
+            result['steps_remaining'] = torch.as_tensor(steps_remaining, device=self.device)
+        if not compact:
+            result.update(observations=tensors(observations), next_observations=tensors(next_observations))
+        if failure_horizon is not None:
+            result.update(tensors({'failure_targets': failure_targets, 'failure_mask': failure_mask}))
         return result
 
     def size(self) -> int:
@@ -318,83 +375,40 @@ class SequenceReplayBuffer:
         Returns:
             Dict containing all buffer data and indices for serialization.
         """
-        # Serialize episodes
-        episodes_data = []
-        for ep in self.episodes:
-            ep_data = {
-                'observations': ep.observations,
-                'actions': ep.actions,
-                'rewards': ep.rewards,
-                'terminateds': ep.terminateds,
-                'final_obs': ep.final_obs,
-                'length': ep.length,
-            }
-            episodes_data.append(ep_data)
-
-        # Serialize current episode if exists
-        current_ep_data = None
-        if self.current_episode is not None:
-            current_ep_data = {
-                'observations': self.current_episode.observations,
-                'actions': self.current_episode.actions,
-                'rewards': self.current_episode.rewards,
-                'terminateds': self.current_episode.terminateds,
-                'final_obs': self.current_episode.final_obs,
-                'length': self.current_episode.length,
-            }
-
+        active = [ep.get_state() if ep is not None else None for ep in self._active_episodes]
         return {
-            'episodes': episodes_data,
-            'current_episode': current_ep_data,
+            'episodes': [episode.get_state() for episode in self.episodes],
+            'active_episodes': active,
+            'current_episode': active[0],
             'total_transitions': self.total_transitions,
             'valid_starts': self.valid_starts,
             'next_ep_idx': self._next_ep_idx,
             'min_valid_ep_idx': self._min_valid_ep_idx,
         }
 
-    def set_state(self, state: Dict) -> None:
+    def set_state(self, state: Dict, *, continuation_observations=None) -> None:
         """
         Restore buffer state from checkpoint.
 
         Args:
             state: Dict from get_state()
+            continuation_observations: If supplied, close each saved active episode
+                with its last next observation before collecting from reset environments.
         """
-        # Clear current buffer
-        self.episodes.clear()
-        self.valid_starts.clear()
-        self.current_episode = None
-        self.total_transitions = 0
-
-        # Restore episodes
-        for ep_data in state['episodes']:
-            ep = EpisodeStorage()
-            ep.observations = ep_data['observations']
-            ep.actions = ep_data['actions']
-            ep.rewards = ep_data['rewards']
-            ep.terminateds = ep_data['terminateds']
-            ep.final_obs = ep_data['final_obs']
-            ep.length = ep_data['length']
-            self.episodes.append(ep)
-
-        # Restore current episode
-        if state['current_episode'] is not None:
-            ep_data = state['current_episode']
-            self.current_episode = EpisodeStorage()
-            self.current_episode.observations = ep_data['observations']
-            self.current_episode.actions = ep_data['actions']
-            self.current_episode.rewards = ep_data['rewards']
-            self.current_episode.terminateds = ep_data['terminateds']
-            self.current_episode.final_obs = ep_data['final_obs']
-            self.current_episode.length = ep_data['length']
+        saved_active = state.get('active_episodes', [state.get('current_episode')])
+        active = [EpisodeStorage.from_state(data) if data is not None else None for data in saved_active]
+        if continuation_observations is None and any(active[self.n_envs:]):
+            raise ValueError("Replay checkpoint contains active episodes beyond the available environment slots")
+        self.episodes = deque(EpisodeStorage.from_state(data) for data in state['episodes'])
+        self.valid_starts = []
 
         # Restore counters/indices (with backward compatibility for old checkpoints)
         if 'total_transitions' in state:
             self.total_transitions = int(state['total_transitions'])
         else:
-            total = sum(ep.length for ep in self.episodes)
-            if self.current_episode is not None:
-                total += self.current_episode.length
-            self.total_transitions = total
+            self.total_transitions = sum(ep.length for ep in self.episodes) + sum(
+                ep.length for ep in active if ep is not None
+            )
 
         self._next_ep_idx = int(state.get('next_ep_idx', len(self.episodes)))
         self._min_valid_ep_idx = int(state.get('min_valid_ep_idx', 0))
@@ -416,6 +430,20 @@ class SequenceReplayBuffer:
         min_next_ep_idx = self._min_valid_ep_idx + len(self.episodes)
         if self._next_ep_idx < min_next_ep_idx:
             self._next_ep_idx = min_next_ep_idx
+
+        self._active_episodes = [None] * self.n_envs
+        if continuation_observations is None:
+            self._active_episodes[:min(len(active), self.n_envs)] = active[:self.n_envs]
+        else:
+            for index, episode in enumerate(active):
+                if episode is None:
+                    continue
+                continuation = continuation_observations[index] if index < len(continuation_observations) else None
+                if continuation is None:
+                    self.total_transitions -= episode.length
+                else:
+                    episode.set_final_obs(continuation)
+                    self._store_episode(episode)
 
     def _rebuild_valid_starts(self) -> None:
         """Rebuild valid start indices from restored episodes."""

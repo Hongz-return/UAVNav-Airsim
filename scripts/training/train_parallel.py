@@ -35,6 +35,9 @@ METHOD_CONFIGS = {
     "mamba": Path("configs/config_mamba.ini"),
     "ma": Path("configs/config_mamba_coordatt.ini"),
     "transformer": Path("configs/config_transformer.ini"),
+    "ma_motion": Path("configs/config_ma_motion.ini"),
+    "ma_aux": Path("configs/config_ma_aux.ini"),
+    "ma_motion_aux": Path("configs/config_ma_motion_aux.ini"),
 }
 
 SCENES = {
@@ -51,13 +54,21 @@ SCENES = {
     },
     "tunnel_activate": {
         "env_name": "Obs",
-        "map_path": "/Game/Tunnel_Col_Vol1/Maps/ObsTunnel",
+        "map_path": "/Game/Tunnel_Col_Vol1/Maps/Tunnel_Activate",
         "timesteps": 200_000,
     },
     "tunnel_mixed": {
         "env_name": "Obs",
         "map_path": "/Game/Tunnel_Col_Vol1/Maps/Tunnel_AO",
         "timesteps": 200_000,
+    },
+    "rail_single_dynamic": {
+        "env_name": "Obs",
+        "map_path": "/Game/RailwayTunnelPrototype/Maps/02_Conditions/SingleTrack/L_SingleTrack_SCurve_DynamicMaintenance",
+        "timesteps": 200_000,
+        # Local NED coordinates calibrated with the same -1.5 m vehicle spawn setting.
+        "goal_position": [108.029625, 24.986841, -1.5],
+        "requires_existing_airsim": True,
     },
 }
 
@@ -188,12 +199,15 @@ def write_runtime_config(
     env_name: str,
     airsim_ip: str,
     port: int,
+    goal_position: list[float] | None = None,
 ) -> None:
     cfg = ConfigParser()
     cfg.read(source, encoding="utf-8")
     if not cfg.has_section("options"):
         raise ValueError(f"Invalid config: {source}")
     cfg.set("options", "env_name", env_name)
+    if goal_position is not None:
+        cfg.set("environment", "goal_position", repr(goal_position))
     if not cfg.has_section("airsim"):
         cfg.add_section("airsim")
     cfg.set("airsim", "ip", airsim_ip)
@@ -293,6 +307,8 @@ def main() -> int:
     args = parse_args()
     run_id = datetime.now().strftime("%Y_%m_%d_%H_%M_%S_%f")
     scene = SCENES[args.scene]
+    if scene.get("requires_existing_airsim") and not args.no_launch_airsim:
+        raise ValueError(f"{args.scene} requires prestarted UE game instances and --no-launch-airsim")
     timesteps = args.timesteps or scene["timesteps"]
     jobs = build_jobs(args, run_id)
     batches = build_batches(jobs, args.max_parallel)
@@ -320,6 +336,7 @@ def main() -> int:
             env_name=scene["env_name"],
             airsim_ip=args.airsim_ip,
             port=job.port,
+            goal_position=scene.get("goal_position"),
         )
 
     run_dir = PARALLEL_RUNS_ROOT / run_id
@@ -332,6 +349,7 @@ def main() -> int:
         "run_id": run_id,
         "scene": args.scene,
         "map_path": map_path,
+        "scene_goal_position": scene.get("goal_position"),
         "timesteps_per_job": timesteps,
         "topology": "independent_single_env_processes",
         "schedule": "method_major",

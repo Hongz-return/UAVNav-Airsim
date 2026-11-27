@@ -1,8 +1,9 @@
-# 当前实验复现说明
+# 隧道实验复现说明
 
 固定口径版本：2026-07-30
 
 实验数据结构请参阅 [`Logs/README.md`](Logs/README.md)。
+第四章采用独立的 [TrainEnv 训练入口](scripts/README.md#ue54-trainenv)。
 
 ## 实验矩阵
 
@@ -15,6 +16,10 @@
 | `tunnel_obs` | 静态障碍隧道 | 150,000 steps |
 | `tunnel_activate` | 动态障碍隧道 | 200,000 steps |
 | `tunnel_mixed` | 动静混合隧道 | 200,000 steps |
+| `rail_single_dynamic` | 单线 S 弯动态检修铁路隧道 | 200,000 steps |
+
+`rail_single_dynamic` 当前使用工程中预先启动的 UE 游戏实例，训练启动器必须指定
+`--no-launch-airsim`，并确保各端口加载对应铁路地图、统一相机和车辆设置。
 
 `tunnel_obs` 每个 seed 的训练预算为 150,000 steps。
 
@@ -56,13 +61,13 @@ seed `0 1 2`、每个任务 200,000 steps，并统一从新打包的
 `D:\UEBuilds\TunnelEnv\Windows\Tunnel.exe` 启动 `Tunnel_AO`。先检查计划：
 
 ```powershell
-.\scripts\training\train_env4_local.ps1
+.\archive\scripts\training\train_env4_local.ps1
 ```
 
 确认计划后，一键启动本机的 9 个正式训练任务：
 
 ```powershell
-.\scripts\training\train_env4_local.ps1 -Execute
+.\archive\scripts\training\train_env4_local.ps1 -Execute
 ```
 
 该入口不会训练 `mamba`、`ma` 和 `transformer`；三者保留给另一台电脑，

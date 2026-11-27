@@ -40,6 +40,11 @@ def build_mamba_policy_kwargs(cfg: ConfigParser) -> dict:
         'backend': mamba_backend,
         'transformer_heads': cfg.getint('mamba', 'transformer_heads', fallback=4),
         'transformer_layers': cfg.getint('mamba', 'transformer_layers', fallback=2),
+        'aux_weight': cfg.getfloat('aux', 'aux_weight', fallback=0.0),
+        'aux_target': cfg.get('aux', 'aux_target', fallback='next_depth'),
+        'aux_out_h': cfg.getint('aux', 'aux_out_h', fallback=15),
+        'aux_out_w': cfg.getint('aux', 'aux_out_w', fallback=22),
+        'aux_hidden': cfg.getint('aux', 'aux_hidden', fallback=256),
     }
 
 

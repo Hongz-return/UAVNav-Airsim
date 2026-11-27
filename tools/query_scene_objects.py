@@ -9,7 +9,6 @@ try:
 except ImportError:
     import airsim
 
-PORT = 41451
 
 def main():
     client = airsim.VehicleClient()

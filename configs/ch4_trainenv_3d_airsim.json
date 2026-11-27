@@ -1,0 +1,24 @@
+{
+  "SettingsVersion": 2,
+  "SimMode": "Multirotor",
+  "ViewMode": "NoDisplay",
+  "LocalHostIp": "127.0.0.1",
+  "MoveWorldOrigin": false,
+  "Vehicles": {
+    "SimpleFlight": {
+      "VehicleType": "SimpleFlight",
+      "AutoCreate": true,
+      "X": 0,
+      "Y": 0,
+      "Z": 0,
+      "Yaw": 0,
+      "EnableCollisions": true,
+      "EnableCollisionPassthrough": false
+    }
+  },
+  "CameraDefaults": {
+    "CaptureSettings": [
+      {"ImageType": 1, "Width": 320, "Height": 180, "FOV_Degrees": 90}
+    ]
+  }
+}

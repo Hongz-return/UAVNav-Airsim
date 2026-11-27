@@ -1,0 +1,26 @@
+{
+  "name": "uav-rviz-web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "UAV AirSim 实时 RViz 监控台前端（离线静态构建产物输出到 dist/）",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "three": "^0.187.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/three": "^0.187.0",
+    "@vitejs/plugin-react": "^6.0.0",
+    "typescript": "^5.9.0",
+    "vite": "^8.0.0"
+  }
+}
