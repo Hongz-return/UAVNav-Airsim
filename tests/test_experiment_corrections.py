@@ -249,7 +249,6 @@ class ExperimentCorrectionsTest(unittest.TestCase):
             action_space = spaces.Box(low=-1., high=1., shape=(3,), dtype=np.float32)
             def __init__(self):
                 self.envs = [Base()]
-                self.episode = 0
             def reset(self):
                 self.envs[0].episode_start_wall_time = 10.
                 self.envs[0].episode_start_state_timestamp = 100
@@ -263,7 +262,6 @@ class ExperimentCorrectionsTest(unittest.TestCase):
                         'state_timestamp': timestamp + 200, 'terminal_position': [2, 0, 0],
                         'is_success': True, 'is_crash': False, 'step_num': 1,
                         'min_distance_to_obstacles': 3.}
-                self.episode += 1
                 base.episode_start_wall_time = start + 100.
                 base.episode_start_state_timestamp = timestamp + 1000
                 return np.zeros((1, 1)), np.array([1.]), np.array([True]), [info]

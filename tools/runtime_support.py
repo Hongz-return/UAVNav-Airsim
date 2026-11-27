@@ -3,7 +3,10 @@
 import ast
 import os
 import pickle
+import time
 from configparser import ConfigParser
+from copy import deepcopy
+from functools import partial
 from typing import Optional
 
 import gymnasium as gym
@@ -13,7 +16,7 @@ from stable_baselines3 import PPO, SAC, TD3
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.noise import NormalActionNoise
-from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecTransposeImage
 
 import gym_env  # Registers the custom env id used by both train and evaluate.
 from gym_env.algorithms import MambaSAC
@@ -124,13 +127,28 @@ class CheckpointMonitor(Monitor):
         return output
 
 
-def build_runtime_env(cfg: ConfigParser):
-    """Create the gym env and apply the shared runtime wrappers used by train/eval."""
+def _build_monitored_env(cfg: ConfigParser, training: bool = False):
+    """Create and wrap one AirSim connection inside its owning process."""
+    crossing = False
+    if cfg.has_option("stage3_v2", "crossing_mode"):
+        from tools.ue_benchmark.ch4_stage3_crossing import CrossingCourseEnv, crossing_mode
+        crossing = crossing_mode(cfg) != "off"
+        if crossing and (not cfg.getboolean("airsim", "synchronous_steps", fallback=False)
+                         or cfg.has_option("scene", "runtime_script")):
+            raise ValueError("TrainEnv cross traffic requires its own synchronous AirSim clock")
     env = gym.make("airsim-env-v0")
     env.unwrapped.set_config(cfg)
+    if (training or crossing) and cfg.has_section("stage3_v2"):
+        from tools.ue_benchmark.ch4_stage3_v2_training import Stage3V2Course
+        env.unwrapped.stage3_course = Stage3V2Course(cfg)
+    elif training and cfg.has_section("stage3"):
+        from tools.ue_benchmark.ch4_stage3_training import Stage3TrainingCourse
+        env.unwrapped.stage3_course = Stage3TrainingCourse(cfg)
     if cfg.has_option('scene', 'runtime_script'):
         from gym_env.wrappers.sequence_scene import SequenceSceneWrapper
         env = SequenceSceneWrapper(env, cfg)
+    if crossing:
+        env = CrossingCourseEnv(env)
 
     n_stack = get_frame_stack_count(cfg)
     if n_stack > 1:
@@ -139,11 +157,67 @@ def build_runtime_env(cfg: ConfigParser):
     else:
         print("Frame stacking: disabled (n_stack=1)")
 
-    env = CheckpointMonitor(env) if use_mamba_backend(cfg) else Monitor(env)
-    monitored_env = env
-    env = DummyVecEnv([lambda e=monitored_env: e])
-    env = VecTransposeImage(env)
-    return env
+    return CheckpointMonitor(env) if use_mamba_backend(cfg) else Monitor(env)
+
+
+def build_runtime_env(cfg: ConfigParser, *, training: bool = False):
+    """Create the gym env and apply the shared runtime wrappers used by train/eval."""
+    options = {"training": True} if training else {}
+    return VecTransposeImage(DummyVecEnv([partial(_build_monitored_env, cfg, **options)]))
+
+
+class _AirSimWorkers(SubprocVecEnv):
+    """Close all owned workers even when one RPC worker exits mid-batch."""
+
+    def __init__(self, factories):
+        try:
+            super().__init__(factories, start_method="spawn")
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        for remote in getattr(self, "remotes", ()):
+            try:
+                remote.send(("close", None))
+            except OSError:
+                pass  # The worker already exited or its pipe failed.
+            finally:
+                remote.close()
+        for remote in getattr(self, "work_remotes", ()):
+            remote.close()
+        processes = getattr(self, "processes", ())
+        deadline = time.monotonic() + 5.0
+        for process in processes:
+            process.join(max(deadline - time.monotonic(), 0))
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes:
+            process.join()
+
+
+def build_parallel_runtime_env(cfg: ConfigParser, ports: list[int], base_seed: int = 0, *, training: bool = False):
+    """Run one independently seeded AirSim environment per RPC port."""
+    if not ports or len(set(ports)) != len(ports):
+        raise ValueError("AirSim RPC ports must be non-empty and distinct")
+    factories = []
+    options = {"training": True} if training else {}
+    for port in ports:
+        worker_cfg = deepcopy(cfg)
+        worker_cfg.read_dict({"airsim": {"rpc_port": port}})
+        factories.append(partial(_build_monitored_env, worker_cfg, **options))
+    workers = _AirSimWorkers(factories)
+    try:
+        env = VecTransposeImage(workers)
+        env.seed(base_seed)
+        return env
+    except BaseException:
+        workers.close()
+        raise
 
 
 def get_per_config(cfg: ConfigParser, total_timesteps: int) -> dict:
@@ -246,6 +320,8 @@ def create_model(algo: str, env, cfg: ConfigParser, log_path: str, seed: int = 0
             train_freq=cfg.getint("DRL", "train_freq"),
             gradient_steps=cfg.getint("DRL", "gradient_steps"),
             critic_loss=cfg.get("DRL", "critic_loss", fallback="huber"),
+            fast_history=cfg.getboolean("DRL", "fast_history", fallback=False),
+            overlap_updates=cfg.getboolean("DRL", "overlap_updates", fallback=False),
             tensorboard_log=log_path,
             policy_kwargs=mamba_policy_kwargs,
             seed=seed,
@@ -304,7 +380,8 @@ def create_model(algo: str, env, cfg: ConfigParser, log_path: str, seed: int = 0
     raise ValueError(f"Unknown algorithm: {algo}")
 
 
-def load_model(algo: str, model_file: str, env, cfg: Optional[ConfigParser] = None, tensorboard_log: Optional[str] = None):
+def load_model(algo: str, model_file: str, env, cfg: Optional[ConfigParser] = None,
+               tensorboard_log: Optional[str] = None, *, load_replay: bool = True, seed: Optional[int] = None):
     """Load a trained model for evaluation or resume, honoring the active backend."""
     use_mamba = use_mamba_backend(cfg) if cfg else False
 
@@ -326,6 +403,8 @@ def load_model(algo: str, model_file: str, env, cfg: Optional[ConfigParser] = No
             model_file,
             env=env,
             policy_kwargs=policy_kwargs,
+            load_buffer=load_replay,
+            seed=seed,
             learning_rate=learning_rate,
             seq_len=cfg.getint("mamba", "seq_len", fallback=16),
             buffer_size=cfg.getint("DRL", "buffer_size"),
@@ -335,6 +414,8 @@ def load_model(algo: str, model_file: str, env, cfg: Optional[ConfigParser] = No
             train_freq=cfg.getint("DRL", "train_freq"),
             gradient_steps=cfg.getint("DRL", "gradient_steps"),
             critic_loss=cfg.get("DRL", "critic_loss", fallback="huber"),
+            fast_history=cfg.getboolean("DRL", "fast_history", fallback=False),
+            overlap_updates=cfg.getboolean("DRL", "overlap_updates", fallback=False),
             tensorboard_log=tensorboard_log,
         )
         # Restoring optimizer state also restores its old parameter-group LR.
@@ -361,16 +442,23 @@ class MambaCheckpointCallback(BaseCallback):
         super().__init__(verbose)
         self.save_freq = save_freq
         self.save_path = save_path
+        self.next_save_step = self.save_freq
         self.full_save_freq = 20000
         self.next_full_step = self.full_save_freq
 
     def _on_training_start(self) -> None:
+        if self.model.n_envs == 1:
+            self.next_save_step = self.num_timesteps + self.save_freq - self.n_calls % self.save_freq
+        else:
+            self.next_save_step = (self.num_timesteps // self.save_freq + 1) * self.save_freq
         self.next_full_step = (self.num_timesteps // self.full_save_freq + 1) * self.full_save_freq
 
     def _on_step(self) -> bool:
-        if self.n_calls % self.save_freq == 0:
+        if self.num_timesteps >= self.next_save_step:
             path = f"{self.save_path}/checkpoint_{self.num_timesteps}_steps"
             self.model.save(path, include_buffer=False)
+            crossed = (self.num_timesteps - self.next_save_step) // self.save_freq + 1
+            self.next_save_step += crossed * self.save_freq
             if self.verbose > 0:
                 print(f"[Checkpoint] Saved weights-only checkpoint to {path}")
         if self.num_timesteps >= self.next_full_step and np.any(self.locals.get('dones', False)):
@@ -392,11 +480,20 @@ class OffPolicyCheckpointCallback(BaseCallback):
         self.save_freq = save_freq
         self.save_path = save_path
         self.name_prefix = name_prefix
+        self.next_save_step = self.save_freq
+
+    def _on_training_start(self) -> None:
+        if self.model.n_envs == 1:
+            self.next_save_step = self.num_timesteps + self.save_freq - self.n_calls % self.save_freq
+        else:
+            self.next_save_step = (self.num_timesteps // self.save_freq + 1) * self.save_freq
 
     def _on_step(self) -> bool:
-        if self.n_calls % self.save_freq == 0:
+        if self.num_timesteps >= self.next_save_step:
             path = os.path.join(self.save_path, f"{self.name_prefix}_{self.num_timesteps}_steps")
             self.model.save(path)
+            crossed = (self.num_timesteps - self.next_save_step) // self.save_freq + 1
+            self.next_save_step += crossed * self.save_freq
             if self.verbose > 0:
                 print(f"[Checkpoint] Saved weights-only model to {path}.zip")
         return True

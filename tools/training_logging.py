@@ -1,5 +1,6 @@
 """TensorBoard metric writers and training callbacks."""
 
+import time
 from typing import Optional
 
 import numpy as np
@@ -99,6 +100,38 @@ def record_mamba_rollout_metrics(logger, episode_num, total_timesteps, buffer_si
         logger.record("rollout/success_ep_len_mean", np.mean(success_episode_lengths[-100:]))
 
 
+class TrainingProgressCallback(BaseCallback):
+    """Report observed transitions and gradient updates during sustained runs."""
+
+    def __init__(self, every: int):
+        super().__init__()
+        self.every = every
+
+    def _on_training_start(self):
+        self.last_step = self.num_timesteps
+        self.last_time = time.perf_counter()
+        self.next_step = (self.num_timesteps // self.every + 1) * self.every
+
+    def _report(self):
+        now = time.perf_counter()
+        rate = (self.num_timesteps - self.last_step) / max(now - self.last_time, 1e-9)
+        print(
+            f"[Progress] steps={self.num_timesteps} updates={self.model._n_updates} "
+            f"transitions/s={rate:.2f}", flush=True,
+        )
+        self.last_step, self.last_time = self.num_timesteps, now
+
+    def _on_step(self):
+        if self.num_timesteps >= self.next_step:
+            self._report()
+            self.next_step = (self.num_timesteps // self.every + 1) * self.every
+        return True
+
+    def _on_training_end(self):
+        if self.num_timesteps > self.last_step:
+            self._report()
+
+
 class UAVLoggingCallback(BaseCallback):
     """Log UAV state and episode-level statistics for all training algorithms."""
 
@@ -120,8 +153,16 @@ class UAVLoggingCallback(BaseCallback):
         self.current_episode_yaw_rates = []
         self.current_episode_vertical_speeds = []
         self.current_episode_obstacle_dists = []
+        self._summary_freq = 1000
+        self._next_summary_step = self._summary_freq
+
+    def _on_training_start(self) -> None:
+        self._next_summary_step = (self.num_timesteps // self._summary_freq + 1) * self._summary_freq
 
     def _get_base_env(self):
+        # Per-step telemetry here belongs to a single local vehicle.
+        if self.training_env.num_envs != 1 or not hasattr(self.training_env, "envs"):
+            return None
         env = self.training_env.envs[0]
         while hasattr(env, "env"):
             env = env.env
@@ -225,37 +266,40 @@ class UAVLoggingCallback(BaseCallback):
         if self.success_episode_steps:
             self.logger.record("rollout/success_ep_len_mean", np.mean(self.success_episode_steps[-100:]))
 
-        if self.n_calls % 1000 == 0 and self.episode_successes:
-            self.logger.record("episode/success_rate_recent", np.mean(self.episode_successes[-100:]))
-            self.logger.record("episode/crash_rate_recent", np.mean(self.episode_crashes[-100:]))
-            if self.last_success_episode_steps is not None:
-                self.logger.record("episode/success_steps_last", self.last_success_episode_steps)
-            if self.success_episode_steps:
-                self.logger.record("episode/success_steps_mean_recent", np.mean(self.success_episode_steps[-100:]))
+        if self.num_timesteps >= self._next_summary_step:
+            crossed = (self.num_timesteps - self._next_summary_step) // self._summary_freq + 1
+            self._next_summary_step += crossed * self._summary_freq
+            if self.episode_successes:
+                self.logger.record("episode/success_rate_recent", np.mean(self.episode_successes[-100:]))
+                self.logger.record("episode/crash_rate_recent", np.mean(self.episode_crashes[-100:]))
+                if self.last_success_episode_steps is not None:
+                    self.logger.record("episode/success_steps_last", self.last_success_episode_steps)
+                if self.success_episode_steps:
+                    self.logger.record("episode/success_steps_mean_recent", np.mean(self.success_episode_steps[-100:]))
 
-            self.logger.record("core/success_rate_recent", np.mean(self.episode_successes[-100:]))
-            self.logger.record("core/collision_rate_recent", np.mean(self.episode_crashes[-100:]))
-            if self.last_success_episode_steps is not None:
-                self.logger.record("core/success_steps_last", self.last_success_episode_steps)
-            if self.success_episode_steps:
-                self.logger.record("core/success_steps_mean_recent", np.mean(self.success_episode_steps[-100:]))
-            if self.success_episode_times:
-                self.logger.record("core/success_time_mean_recent_sec", np.mean(self.success_episode_times[-100:]))
-            if self.episode_rewards:
-                self.logger.record("core/mean_reward_recent", np.mean(self.episode_rewards[-100:]))
-                self.logger.record("core/best_reward", self.best_episode_reward)
-            if self.episode_yaw_rate_abs_means:
-                self.logger.record("core/stability/yaw_rate_abs_mean_recent", np.mean(self.episode_yaw_rate_abs_means[-100:]))
-            if self.episode_vertical_speed_abs_means:
-                self.logger.record(
-                    "core/stability/vertical_speed_abs_mean_recent",
-                    np.mean(self.episode_vertical_speed_abs_means[-100:]),
-                )
-            if self.episode_min_obstacle_dists:
-                self.logger.record(
-                    "core/stability/min_obstacle_dist_mean_recent",
-                    np.mean(self.episode_min_obstacle_dists[-100:]),
-                )
+                self.logger.record("core/success_rate_recent", np.mean(self.episode_successes[-100:]))
+                self.logger.record("core/collision_rate_recent", np.mean(self.episode_crashes[-100:]))
+                if self.last_success_episode_steps is not None:
+                    self.logger.record("core/success_steps_last", self.last_success_episode_steps)
+                if self.success_episode_steps:
+                    self.logger.record("core/success_steps_mean_recent", np.mean(self.success_episode_steps[-100:]))
+                if self.success_episode_times:
+                    self.logger.record("core/success_time_mean_recent_sec", np.mean(self.success_episode_times[-100:]))
+                if self.episode_rewards:
+                    self.logger.record("core/mean_reward_recent", np.mean(self.episode_rewards[-100:]))
+                    self.logger.record("core/best_reward", self.best_episode_reward)
+                if self.episode_yaw_rate_abs_means:
+                    self.logger.record("core/stability/yaw_rate_abs_mean_recent", np.mean(self.episode_yaw_rate_abs_means[-100:]))
+                if self.episode_vertical_speed_abs_means:
+                    self.logger.record(
+                        "core/stability/vertical_speed_abs_mean_recent",
+                        np.mean(self.episode_vertical_speed_abs_means[-100:]),
+                    )
+                if self.episode_min_obstacle_dists:
+                    self.logger.record(
+                        "core/stability/min_obstacle_dist_mean_recent",
+                        np.mean(self.episode_min_obstacle_dists[-100:]),
+                    )
 
         return True
 
@@ -282,6 +326,10 @@ class BestModelCallback(BaseCallback):
         self.episode_successes = []
         self.episode_rewards = []
         self.steps_since_improvement = 0
+        self.next_check_step = self.check_freq
+
+    def _on_training_start(self) -> None:
+        self.next_check_step = (self.num_timesteps // self.check_freq + 1) * self.check_freq
 
     def _on_step(self) -> bool:
         if self.locals.get("dones") is not None:
@@ -293,38 +341,41 @@ class BestModelCallback(BaseCallback):
                     if "episode" in info:
                         self.episode_rewards.append(info["episode"]["r"])
 
-        if self.n_calls % self.check_freq == 0 and len(self.episode_successes) >= self.min_episodes:
-            recent_success = np.mean(self.episode_successes[-50:])
-            recent_reward = np.mean(self.episode_rewards[-50:]) if self.episode_rewards else float("-inf")
+        if self.num_timesteps >= self.next_check_step:
+            crossed = (self.num_timesteps - self.next_check_step) // self.check_freq + 1
+            self.next_check_step += crossed * self.check_freq
+            if len(self.episode_successes) >= self.min_episodes:
+                recent_success = np.mean(self.episode_successes[-50:])
+                recent_reward = np.mean(self.episode_rewards[-50:]) if self.episode_rewards else float("-inf")
 
-            improved = False
-            if recent_success > self.best_success_rate:
-                self.best_success_rate = recent_success
-                improved = True
-            elif recent_success == self.best_success_rate and recent_reward > self.best_mean_reward:
-                improved = True
+                improved = False
+                if recent_success > self.best_success_rate:
+                    self.best_success_rate = recent_success
+                    improved = True
+                elif recent_success == self.best_success_rate and recent_reward > self.best_mean_reward:
+                    improved = True
 
-            if improved:
-                self.best_mean_reward = recent_reward
-                self.steps_since_improvement = 0
-                save_file = f"{self.save_path}/best_model"
-                self.model.save(save_file)
+                if improved:
+                    self.best_mean_reward = recent_reward
+                    self.steps_since_improvement = 0
+                    save_file = f"{self.save_path}/best_model"
+                    self.model.save(save_file)
 
-                if self.verbose > 0:
-                    print(
-                        f"[Best Model] Step {self.n_calls}: success_rate={recent_success:.2%}, "
-                        f"mean_reward={recent_reward:.1f} -> Saved to {save_file}"
-                    )
-            else:
-                self.steps_since_improvement += self.check_freq
+                    if self.verbose > 0:
+                        print(
+                            f"[Best Model] Step {self.num_timesteps}: success_rate={recent_success:.2%}, "
+                            f"mean_reward={recent_reward:.1f} -> Saved to {save_file}"
+                        )
+                else:
+                    self.steps_since_improvement += crossed * self.check_freq
 
-            self.logger.record("best/success_rate", self.best_success_rate)
-            self.logger.record("best/mean_reward", self.best_mean_reward)
-            self.logger.record("best/steps_since_improvement", self.steps_since_improvement)
+                self.logger.record("best/success_rate", self.best_success_rate)
+                self.logger.record("best/mean_reward", self.best_mean_reward)
+                self.logger.record("best/steps_since_improvement", self.steps_since_improvement)
 
-            if self.patience > 0 and self.steps_since_improvement >= self.patience:
-                if self.verbose > 0:
-                    print(f"[Early Stop] No improvement for {self.patience} steps. Stopping training.")
-                return False
+                if self.patience > 0 and self.steps_since_improvement >= self.patience:
+                    if self.verbose > 0:
+                        print(f"[Early Stop] No improvement for {self.patience} steps. Stopping training.")
+                    return False
 
         return True

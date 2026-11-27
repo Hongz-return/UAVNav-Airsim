@@ -17,7 +17,8 @@ class DepthMotionPerception(DepthStatePerception):
             raise ValueError("motion_diff_max must be positive")
         self._previous_depth = None
 
-    def reset(self) -> None:
+    def reset(self, *, rng=None, disable_augmentation=False) -> None:
+        super().reset(rng=rng, disable_augmentation=disable_augmentation)
         self._previous_depth = None
 
     def _image_channels(self, depth_meter, depth_uint8):

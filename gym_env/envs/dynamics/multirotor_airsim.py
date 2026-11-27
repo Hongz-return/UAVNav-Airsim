@@ -40,9 +40,9 @@ def quaternion_to_euler(q):
 
 
 @contextmanager
-def paused_state_reads(dynamics):
-    """Share one render pose and one physics state within a paused control substep."""
-    if not dynamics.synchronous_steps:
+def step_state_reads(dynamics):
+    """Read a fresh pose and physics state once after the action has completed."""
+    if not dynamics.synchronous_steps and getattr(dynamics, "cache_step_state", False) is not True:
         yield
         return
     pose = dynamics.client.simGetVehiclePose(dynamics.vehicle_name)
@@ -54,6 +54,9 @@ def paused_state_reads(dynamics):
         dynamics._paused_readings = None
 
 
+paused_state_reads = step_state_reads
+
+
 class MultirotorDynamicsAirsim:
     """Multirotor dynamics controller for Cosys-AirSim."""
 
@@ -61,12 +64,18 @@ class MultirotorDynamicsAirsim:
         # Config
         self.navigation_3d = cfg.getboolean('options', 'navigation_3d')
         self.using_velocity_state = cfg.getboolean('options', 'using_velocity_state')
+        self.distance_norm_scale = cfg.getfloat('environment', 'distance_norm_scale', fallback=0.0)
+        self.max_vertical_difference = cfg.getfloat('environment', 'max_vertical_difference', fallback=5.0)
+        if not math.isfinite(self.max_vertical_difference) or self.max_vertical_difference <= 0:
+            raise ValueError("environment.max_vertical_difference must be finite and positive")
+        self.align_start_yaw_to_goal = cfg.getboolean('environment', 'align_start_yaw_to_goal', fallback=False)
         self.dt = cfg.getfloat('multirotor', 'dt')
         self.vehicle_name = vehicle_name or cfg.get('airsim', 'vehicle_name', fallback='')
         self.airsim_ip = cfg.get('airsim', 'ip', fallback='')
         self.airsim_port = cfg.getint('airsim', 'rpc_port', fallback=41451)
         self.airsim_timeout = cfg.getfloat('airsim', 'timeout_value', fallback=3600.0)
         self.synchronous_steps = cfg.getboolean('airsim', 'synchronous_steps', fallback=False)
+        self.cache_step_state = cfg.getboolean('airsim', 'cache_step_state', fallback=False)
 
         # AirSim client (shared if provided, else create new)
         if client is not None:
@@ -103,7 +112,6 @@ class MultirotorDynamicsAirsim:
         self.v_z_max = cfg.getfloat('multirotor', 'v_z_max')
         self.yaw_rate_max_deg = cfg.getfloat('multirotor', 'yaw_rate_max_deg')
         self.yaw_rate_max_rad = math.radians(self.yaw_rate_max_deg)
-        self.max_vertical_difference = 5
 
         # State feature length and action space
         if self.navigation_3d:
@@ -144,11 +152,18 @@ class MultirotorDynamicsAirsim:
 
         # Set pose for this vehicle
         random_source = rng if rng is not None else np.random
-        yaw = (
-            self.start_fixed_yaw
-            if self.start_fixed_yaw is not None
-            else self.start_random_angle * random_source.random()
-        )
+        if self.start_fixed_yaw is not None:
+            yaw = self.start_fixed_yaw
+        else:
+            base_yaw = (
+                math.atan2(
+                    self.goal_position[1] - self.start_position_enu[1],
+                    self.goal_position[0] - self.start_position_enu[0],
+                )
+                if self.align_start_yaw_to_goal
+                else 0.0
+            )
+            yaw = base_yaw + self.start_random_angle * (2.0 * random_source.random() - 1.0)
         if self.synchronous_steps:
             state = airsim.KinematicsState()
             state.position = airsim.Vector3r(*self.start_position)
@@ -234,6 +249,7 @@ class MultirotorDynamicsAirsim:
             yaw_mode=yaw_mode, vehicle_name=self.vehicle_name,
         )
         advanced = 0.0
+        minimum_window = 0.002
         scene_step = getattr(self, 'scene_step_callback', None)
         last_progress = time.monotonic()
         try:
@@ -244,13 +260,18 @@ class MultirotorDynamicsAirsim:
                 window = control_duration - advanced
                 if scene_step is not None:
                     window = min(window, 0.05)
-                self.client.simContinueForTime(max(0.002, window))
+                self.client.simContinueForTime(max(minimum_window, window))
                 timestamp = self.client.getMultirotorState(vehicle_name=self.vehicle_name).timestamp
                 advanced = (timestamp - before) / 1e9
                 if scene_step is not None:
                     scene_step(timestamp)
                 if advanced > previous_advance:
                     last_progress = time.monotonic()
+                    minimum_window = 0.002
+                else:
+                    # A short trailing wall-time window can end before one
+                    # SteppableClock physics tick is scheduled.
+                    minimum_window = 0.010
         finally:
             self.client.simPause(True)
             self.client.cancelLastTask(self.vehicle_name)
@@ -331,6 +352,7 @@ class MultirotorDynamicsAirsim:
     def _get_state_feature(self):
         """Get normalized state features in [0, 1] range (float32 precision)."""
         pos = self.get_position()
+        self.state_altitude_above_start = pos[2] - self.start_position_enu[2]
         vel = self.get_velocity()
 
         distance = self.get_distance_to_goal_3d() if self.navigation_3d else self.get_distance_to_goal_2d()
@@ -338,7 +360,10 @@ class MultirotorDynamicsAirsim:
         relative_yaw = self._get_relative_yaw()
 
         # Normalize directly to [0, 1] for better precision
-        dist_norm = distance / max(self.goal_distance, 1e-6)
+        if self.distance_norm_scale > 0:
+            dist_norm = distance / self.distance_norm_scale
+        else:
+            dist_norm = distance / max(self.goal_distance, 1e-6)
         z_norm = relative_z / self.max_vertical_difference / 2 + 0.5
         yaw_norm = relative_yaw / math.pi / 2 + 0.5
         v_forward_norm = (vel[0] - self.v_xy_min) / (self.v_xy_max - self.v_xy_min)

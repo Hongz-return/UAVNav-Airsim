@@ -139,7 +139,7 @@ class EnvironmentResetTest(unittest.TestCase):
                     reset=Mock(), get_distance_to_goal_3d=lambda: 1.0,
                     set_start=Mock(), _set_goal_pose_single=Mock(),
                 )
-                env.perception = SimpleNamespace(reset=lambda: calls.append('reset'))
+                env.perception = SimpleNamespace(reset=Mock(side_effect=lambda **_: calls.append('reset')))
                 env.task = None
                 env.episode_num = 0
                 env._get_obs = lambda: calls.append('observation') or {'test': True}
@@ -150,6 +150,7 @@ class EnvironmentResetTest(unittest.TestCase):
                     }])
                 obs, info = env.reset(seed=0)
                 self.assertEqual(calls, ['reset', 'observation'])
+                env.perception.reset.assert_called_once_with(rng=env.np_random, disable_augmentation=evaluation)
                 self.assertEqual(obs, {'test': True})
                 self.assertEqual(info['scenario_id'], 'test' if evaluation else None)
 

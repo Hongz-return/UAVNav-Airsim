@@ -31,7 +31,9 @@ class VectorPerception(BasePerception):
             dtype=np.float32,
         )
 
-    def get_observation(self, state_feature: np.ndarray = None) -> np.ndarray:
+    def get_observation(
+        self, state_feature: np.ndarray = None, *, dz_above_start: float | None = None
+    ) -> np.ndarray:
         """Get normalized state vector only (no depth image query)."""
         # No depth image -> no obstacle distance info
         self.min_distance_to_obstacles = float('inf')

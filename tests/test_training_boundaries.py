@@ -100,9 +100,10 @@ class TrainingBoundaryTests(unittest.TestCase):
         np.testing.assert_array_equal(restored.actions[0], live.actions[1])
 
     def test_synchronous_substep_reuses_pose_and_state(self):
-        def run(synchronous):
+        def run(synchronous, cache_step_state=False):
             cfg = read_config('ma')
-            cfg.read_dict({'airsim': {'synchronous_steps': str(synchronous)}})
+            cfg.read_dict({'airsim': {'synchronous_steps': str(synchronous),
+                                     'cache_step_state': str(cache_step_state)}})
             client = Mock()
             client.getSettingsString.return_value = '{"ClockType":"SteppableClock"}'
             dynamics = MultirotorDynamicsAirsim(cfg, client=client)
@@ -148,6 +149,11 @@ class TrainingBoundaryTests(unittest.TestCase):
         self.assertEqual(info['state_timestamp'], 200)
         self.assertEqual(synchronous_calls, (2, 2))
         self.assertEqual(asynchronous_calls, (12, 3))
+        real_time, reward, info, cached_calls = run(False, cache_step_state=True)
+        np.testing.assert_array_equal(reference, real_time)
+        self.assertEqual(reward, old_reward)
+        self.assertEqual(info["state_timestamp"], 200)
+        self.assertEqual(cached_calls, (2, 2))
 
     def test_continuing_and_restarting_a_partial_rollout(self):
         model = make_model(read_config('ma'))

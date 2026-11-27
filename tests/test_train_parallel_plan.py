@@ -5,6 +5,7 @@ from configparser import ConfigParser
 import re
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from scripts.training.train_parallel import (
     METHOD_CONFIGS,
@@ -14,6 +15,7 @@ from scripts.training.train_parallel import (
     build_jobs,
     default_ports,
     read_start_position,
+    write_runtime_config,
 )
 
 # Budgets are the experiment protocol, so RETRAINING.md is the source of truth
@@ -59,6 +61,24 @@ class SceneBudgetTest(unittest.TestCase):
             with self.subTest(scene=scene):
                 self.assertIn(spec["env_name"], {"Tunnel", "Obs"})
                 self.assertTrue(spec["map_path"].startswith("/Game/"))
+
+    def test_env3_defaults_to_the_packaged_dynamic_map(self):
+        self.assertEqual(SCENES["tunnel_activate"]["map_path"],
+                         "/Game/Tunnel_Col_Vol1/Maps/Tunnel_Activate")
+
+    def test_railway_scene_uses_calibrated_goal_for_all_methods(self):
+        scene = SCENES['rail_single_dynamic']
+        self.assertTrue(scene['requires_existing_airsim'])
+        with TemporaryDirectory() as tmp:
+            for method in ('ma', 'ma_motion', 'ma_aux', 'ma_motion_aux'):
+                target = Path(tmp) / f'{method}.ini'
+                write_runtime_config(ROOT / METHOD_CONFIGS[method], target,
+                                     env_name=scene['env_name'], airsim_ip='127.0.0.1',
+                                     port=41571, goal_position=scene['goal_position'])
+                cfg = ConfigParser()
+                cfg.read(target, encoding='utf-8')
+                self.assertEqual(cfg.get('environment', 'start_position'), '[0, 0, -1.5]')
+                self.assertEqual(cfg.get('environment', 'goal_position'), repr(scene['goal_position']))
 
     def test_every_method_config_exists(self):
         for method, config in METHOD_CONFIGS.items():

@@ -23,7 +23,7 @@ from tools.experiment_paths import EVALUATION_RESULTS_ROOT, evaluation_parent_fo
 DEFAULT_EPISODES = 100
 
 
-def parse_args():
+def parse_args(argv=None):
     """Parse CLI args for evaluation."""
     parser = argparse.ArgumentParser(description="Evaluate trained UAV navigation model")
     parser.add_argument(
@@ -120,12 +120,53 @@ def parse_args():
             "(e.g. 2/4/6/8). seq_len=1 is equivalent to --no-history."
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--scene-config",
+        type=str,
+        default=None,
+        help="Optional .ini config overriding [environment], [scene], and [perception] for cross-scene evaluation",
+    )
+    return parser.parse_args(argv)
 
 
-def apply_evaluation_overrides(cfg, env_name=None, airsim_ip=None, airsim_port=None):
+def apply_evaluation_overrides(cfg, env_name=None, airsim_ip=None, airsim_port=None, scene_config=None):
     """Apply runtime-only evaluation overrides in memory."""
     apply_config_overrides(cfg, env_name_override=env_name)
+    if scene_config is not None:
+        if not os.path.exists(scene_config):
+            raise FileNotFoundError(f"Scene config not found: {scene_config}")
+        scene_cfg = ConfigParser()
+        scene_cfg.read(scene_config, encoding="utf-8")
+        if not scene_cfg.has_section("environment"):
+            raise ValueError(f"Scene config '{scene_config}' is missing [environment] section")
+        for key in ("max_depth_meters", "screen_height", "screen_width", "distance_norm_scale", "max_vertical_difference"):
+            if not scene_cfg.has_option("environment", key):
+                continue
+            fallback = 5.0 if key == "max_vertical_difference" else None
+            model_value = cfg.getfloat("environment", key, fallback=fallback)
+            if model_value is not None and not np.isclose(model_value, scene_cfg.getfloat("environment", key)):
+                raise ValueError(
+                    f"Incompatible scene config option environment.{key}: "
+                    f"model={model_value} vs scene={scene_cfg.get('environment', key)}"
+                )
+        for key, value in scene_cfg.items("environment"):
+            cfg.set("environment", key, value)
+        if not scene_cfg.has_option("environment", "training_routes"):
+            cfg.remove_option("environment", "training_routes")
+        if scene_cfg.has_section("scene"):
+            if not cfg.has_section("scene"):
+                cfg.add_section("scene")
+            for key, value in scene_cfg.items("scene"):
+                cfg.set("scene", key, value)
+        if not cfg.has_section("perception"):
+            cfg.add_section("perception")
+        if scene_cfg.has_section("perception"):
+            for key, value in scene_cfg.items("perception"):
+                cfg.set("perception", key, value)
+        if not scene_cfg.has_option("perception", "virtual_ceiling_prob"):
+            cfg.set("perception", "virtual_ceiling_prob", "0.0")
+    if (airsim_ip is not None or airsim_port is not None) and not cfg.has_section("airsim"):
+        cfg.add_section("airsim")
     if airsim_ip is not None:
         cfg.set("airsim", "ip", airsim_ip)
     if airsim_port is not None:
@@ -610,13 +651,13 @@ def evaluate(model, env, num_episodes: int, use_history: bool = True):
     return results
 
 
-def main():
-    args = parse_args()
+def main(argv=None, *, runtime_config=None):
+    args = parse_args(argv)
 
     if not args.model_path:
         raise ValueError("Please provide --model_path (-m), e.g. logs/Tunnel/<run_name>")
 
-    config_file = os.path.join(args.model_path, "config", "config.ini")
+    config_file = runtime_config or os.path.join(args.model_path, "config", "config.ini")
     final_model_file = os.path.join(args.model_path, "models", "model_sb3.zip")
     best_model_file = os.path.join(args.model_path, "models", "best_model.zip")
     checkpoint_file = None
@@ -669,6 +710,7 @@ def main():
         env_name=args.env_name,
         airsim_ip=args.airsim_ip,
         airsim_port=args.airsim_port,
+        scene_config=args.scene_config,
     )
     env_name = cfg.get("options", "env_name")
     algo = cfg.get("options", "algo")
@@ -879,6 +921,7 @@ def main():
         print("  terminal_events.csv + *_points.csv - terminal markers for plotting")
         print("  summary_metrics.json/.csv - paper-ready aggregate metrics")
         print("  evaluation_manifest.json - evaluated model and history protocol")
+        return eval_dir
 
 
 if __name__ == "__main__":

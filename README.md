@@ -2,17 +2,13 @@
 
 **Deep reinforcement learning for UAV visual obstacle avoidance in confined tunnels — Cosys-AirSim + Unreal Engine.**
 
-面向隧道受限空间的无人机视觉避障：以单目深度图序列与机体状态为输入、三维速度指令为输出的端到端深度强化学习。仓库包含 MA-SAC 方法实现，以及 6 种 SAC 系算法在 4 类 UE4 隧道场景下的完整训练 / 评估 / 筛选流水线。
-
-![六种算法在动静混合障碍隧道中的同屏飞行对比](docs/figures/demo_env4.gif)
+面向隧道受限空间的无人机视觉避障，以单目深度图序列和机体状态为输入，输出三维速度指令。仓库包含 MA-SAC 方法、UE5.4 TrainEnv 训练入口及 UE4 隧道实验复现工具。
 
 ## 亮点
 
 - **MA-SAC**：CoordAtt 对深度特征做方向感知重标定 + Mamba 选择性状态空间模型对历史观测做选择性记忆，作为 Actor/Critic 的时序主干
 - 自建 **4 类 UE4 隧道场景**：常规 / 静态障碍 / 动态障碍 / 动静混合
 - **6 算法 × 3 随机种子 × 100 回合**标准化评估；多 AirSim 实例 RPC 并行训练、checkpoint 自动筛选、评估 manifest 归档
-
-![四类 UE4 隧道仿真环境：常规 / 静态障碍 / 动态障碍 / 动静混合](docs/figures/environments.png)
 
 ## 方法概述
 
@@ -21,18 +17,14 @@
 - **训练机制**：面向不等长轨迹的序列化 SAC——特征缓存、掩码损失、分阶段梯度更新
 - **对比基线**：SAC(FrameStack4) / CoordAtt-SAC / LSTM-SAC / Transformer-SAC / Mamba-SAC
 
-![MA-SAC 系统框架：环境观测 → CoordAtt 特征重标定 → Mamba 时序主干 → Actor/Critic](docs/figures/architecture.png)
-
-![MA-SAC 与现有方法对比](docs/figures/method_compare.png)
-
 ## 仓库结构
 
 ```
 configs/      各算法与场景的训练配置
 gym_env/      Gymnasium 环境封装、网络结构、回放缓冲、wrappers
-scripts/      训练编排 / 评估 / checkpoint 筛选 / 分析 / 打包入口
-tests/        无仿真自检（仅依赖标准库）
-docs/         架构说明：模块职责与训练→评估→筛选调用链
+scripts/      训练、评估和分析入口
+tests/        无仿真自检
+archive/      历史筛选、便利入口、打包和地图工具
 Logs/         训练与评估产物目录（见 Logs/README.md）
 ```
 
@@ -42,7 +34,10 @@ Logs/         训练与评估产物目录（见 Logs/README.md）
 # Python 环境（pixi）
 pixi install
 
-# 训练（先 dry-run 看计划，确认后去掉 --dry-run）
+# 第四章 TrainEnv 基础模型（四实例、2× 仿真时钟、300000 条转移）
+pixi run python -u -m scripts.training.train_trainenv
+
+# UE4 隧道批量训练计划
 pixi run python -m scripts.training.train_parallel --scene tunnel --dry-run
 
 # 评估
@@ -55,11 +50,9 @@ tensorboard --logdir Logs/TrainData/Runs
 pixi run python -m unittest discover -s tests -t .
 ```
 
-正式运行前请阅读 [`RETRAINING.md`](RETRAINING.md)：实验口径、训练预算与完成判定。
-
 ## 文档
 
-- [`RETRAINING.md`](RETRAINING.md)：实验协议与一键命令
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：模块职责与数据流
-- [`scripts/README.md`](scripts/README.md)：脚本入口
-- [`Logs/README.md`](Logs/README.md)：产物目录约定
+- [TrainEnv 与其他脚本入口](scripts/README.md)
+- [UE4 隧道实验复现协议](RETRAINING.md)
+- [历史工具与复现命令](archive/README.md)
+- [产物目录约定](Logs/README.md)

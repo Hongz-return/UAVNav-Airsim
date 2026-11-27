@@ -14,6 +14,7 @@ from stable_baselines3.common.utils import polyak_update
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.noise import ActionNoise
 
+from gym_env.algorithms.mamba_history import HistoryWindows
 from gym_env.replay.sequence_buffer import SequenceReplayBuffer
 from gym_env.networks.mamba_policy import MambaSACPolicy
 from tools.training_logging import record_mamba_rollout_metrics, record_mamba_training_metrics
@@ -55,6 +56,8 @@ class MambaSAC(BaseAlgorithm):
         critic_loss: str = "huber",
         failure_horizon: int = 30,
         failure_rewards: Tuple[float, float] = (-25.0, -20.0),
+        fast_history: bool = False,
+        overlap_updates: bool = False,
     ):
         super().__init__(
             policy=policy,
@@ -65,13 +68,13 @@ class MambaSAC(BaseAlgorithm):
             verbose=verbose,
             seed=seed,
             device=device,
-            support_multi_env=False,
+            support_multi_env=True,
             supported_action_spaces=(spaces.Box,),
         )
         
         self.buffer_size = buffer_size
         self.learning_starts = learning_starts
-        self._rollout_episode_progress = (0.0, 0)
+        self._rollout_episode_progress = (0.0, 0) if self.n_envs == 1 else [(0.0, 0)] * self.n_envs
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.tau = tau
@@ -83,6 +86,8 @@ class MambaSAC(BaseAlgorithm):
         self.critic_loss = critic_loss
         self.failure_horizon = failure_horizon
         self.failure_rewards = failure_rewards
+        self.fast_history = fast_history
+        self.overlap_updates = overlap_updates
         
         # Q-value clipping bound to prevent explosion during training.
         # With gamma=0.99, reward in [-2,2], max theoretical Q is ~200.
@@ -91,6 +96,10 @@ class MambaSAC(BaseAlgorithm):
         
         self.ent_coef_init = ent_coef
         self.target_entropy_init = target_entropy
+        self.demo_action_anchor = None
+        self.demo_terminal_altitude_weight = 0.0
+        self.demo_terminal_precision_weight = 0.0
+        self.demo_replay_fraction = 0.0
         
         if _init_setup_model:
             self._setup_model()
@@ -107,6 +116,7 @@ class MambaSAC(BaseAlgorithm):
             action_space=self.action_space,
             seq_len=self.seq_len,
             device=self.device,
+            n_envs=self.n_envs,
         )
         
         # Create policy
@@ -195,42 +205,25 @@ class MambaSAC(BaseAlgorithm):
     
     def _window_indices(self, history_lengths, device, next_step=False):
         """Build reusable gather indices from the replay sampler's CPU metadata."""
-        history = self.policy.actor.inference_seq_len
-        steps = history_lengths.shape[1]
-        indices = (torch.arange(steps, device=device)[:, None] + torch.arange(history, device=device)
-                   + int(next_step))
-        lengths = history_lengths.detach().cpu().reshape(-1)
-        if next_step:
-            lengths = (lengths + 1).clamp(max=history)
-        lengths, positions = lengths.sort(stable=True)
-        unique, counts = lengths.unique_consecutive(return_counts=True)
-        groups = tuple(zip(unique.tolist(), positions.to(device).split(counts.tolist())))
-        return indices, groups
-
-    def _history_window_groups(self, features, states, history_lengths, next_step=False, plan=None):
-        """Gather window features without sharing activations across weight updates."""
-        batch_size, steps = history_lengths.shape
-        history_len = features.shape[1] - steps
-        if history_len != self.policy.actor.inference_seq_len:
-            raise ValueError('Replay context must match the actor inference history length')
-        indices, groups = plan if plan is not None else self._window_indices(history_lengths, features.device, next_step)
-        feature_windows = features[:, indices].reshape(batch_size * steps, history_len, features.shape[-1])
-        state_windows = states[:, indices].reshape(batch_size * steps, history_len, *states.shape[2:])
-        for length, positions in groups:
-            yield (positions,
-                   feature_windows.index_select(0, positions)[:, -length:],
-                   state_windows.index_select(0, positions)[:, -length:])
+        return HistoryWindows(history_lengths, self.policy.actor.inference_seq_len, device, next_step)
 
     def _actor_history_parameters(self, features, states, history_lengths,
                                   next_step=False, return_context=False, plan=None):
         """Evaluate the actor at the last position of each real history window."""
         batch_size, steps = history_lengths.shape
         actor = self.policy.actor
+        plan = plan if plan is not None else self._window_indices(history_lengths, features.device, next_step)
+        if self.fast_history and actor.mamba.supports_batched_last(plan.history):
+            window_features, window_states = plan.gather(features, states)
+            context = actor.masked_last_context(window_features, window_states, plan.device_lengths)
+            means, log_stds = actor.distribution_parameters(context)
+            output = (means.reshape(batch_size, steps, -1), log_stds.reshape(batch_size, steps, -1))
+            return (*output, context.reshape(batch_size, steps, -1)) if return_context else output
+
         means = features.new_zeros(batch_size * steps, actor.action_dim)
         log_stds = torch.zeros_like(means)
         contexts = features.new_zeros(batch_size * steps, self.policy.mamba_hidden_dim) if return_context else None
-        for positions, window_features, window_states in self._history_window_groups(
-                features, states, history_lengths, next_step, plan):
+        for positions, window_features, window_states in plan.gather_groups(features, states):
             mean, log_std, context = actor.forward_sequence_from_features(
                 window_features, window_states, return_context=True,
             )
@@ -262,9 +255,15 @@ class MambaSAC(BaseAlgorithm):
     def _critic_history_values(self, critic, features, states, actions, history_lengths, next_step=False, plan=None):
         batch_size, steps = history_lengths.shape
         flat_actions = actions.reshape(batch_size * steps, -1)
+        plan = plan if plan is not None else self._window_indices(history_lengths, features.device, next_step)
+        if self.fast_history and critic.mamba.supports_batched_last(plan.history):
+            window_features, window_states = plan.gather(features, states)
+            context = critic.masked_last_context(window_features, window_states, plan.device_lengths)
+            return tuple(value.reshape(batch_size, steps)
+                         for value in critic.values_from_context(context, flat_actions))
+
         values = [features.new_zeros(batch_size * steps) for _ in critic.q_networks]
-        for positions, window_features, window_states in self._history_window_groups(
-                features, states, history_lengths, next_step, plan):
+        for positions, window_features, window_states in plan.gather_groups(features, states):
             # The critic's temporal block encodes observations only. Actions
             # enter its per-position Q head; only the last action/output is used.
             window_actions = flat_actions.index_select(0, positions).unsqueeze(1).expand(-1, window_features.shape[1], -1)
@@ -316,10 +315,13 @@ class MambaSAC(BaseAlgorithm):
         
         metric_rows = []
         use_aux = self.policy.aux_weight > 0
-        risk_sample_options = {}
+        sample_options = {}
         if use_aux and self.policy.aux_target == "terminal_risk":
-            risk_sample_options = {"failure_horizon": self.failure_horizon,
-                                   "failure_rewards": self.failure_rewards}
+            sample_options.update(failure_horizon=self.failure_horizon, failure_rewards=self.failure_rewards)
+        if self.demo_action_anchor is not None:
+            sample_options["include_episode_indices"] = True
+            if self.demo_replay_fraction > 0:
+                sample_options["demo_prefix"] = (self.demo_action_anchor[1], self.demo_replay_fraction)
 
         aux_updates_encoder = use_aux and self.policy.cnn_update_mode == "both"
         critic_clip = [p for group in self.policy.critic.optimizer.param_groups for p in group['params']]
@@ -332,139 +334,213 @@ class MambaSAC(BaseAlgorithm):
         for _ in range(gradient_steps):
             # Sample sequence batch
             batch = self.replay_buffer.sample(
-                batch_size, history_len=self.policy.actor.inference_seq_len, compact=True, **risk_sample_options
+                batch_size, history_len=self.policy.actor.inference_seq_len, compact=True, **sample_options
             )
             
-            actions = batch['actions']  # (B, T, action_dim) - SCALED (actual values from env)
-            mask = batch['mask']  # (B, T)
-            context_obs = batch['context_observations']
-            history_lengths = batch['history_lengths']
-            plan = self._window_indices(history_lengths, mask.device)
-
-            # Defensive fix for resumed checkpoints: keep entropy tensor/optimizer on train device.
-            if self.log_ent_coef is not None and self.log_ent_coef.device != mask.device:
-                self.log_ent_coef.data.copy_(self.log_ent_coef.data.to(mask.device))
-                self._move_optimizer_state_to_device(self.ent_coef_optimizer, mask.device)
-            
-            ent_coef = self.log_ent_coef.detach().exp() if self.log_ent_coef is not None else self.ent_coef
-            mask_sum = mask.sum().clamp(min=1.0)  # Avoid division by zero
-            
-            # ========== Critic Update ==========
-            # Both paths see the same online weights before the critic update.
-            # The target critic still encodes its input with its own Polyak CNN.
-            critic_features = self.policy.extract_cnn_features(context_obs)
-            td_targets = self._compute_td_targets(batch, ent_coef, critic_features.detach())
-            q1_values, q2_values = self._critic_history_values(
-                self.policy.critic, critic_features, context_obs['state'], actions, history_lengths, plan=plan,
-            )
-            
-            # Clip Q values to prevent explosion during training
-            q1_values = q1_values.clamp(-self.q_value_bound, self.q_value_bound)
-            q2_values = q2_values.clamp(-self.q_value_bound, self.q_value_bound)
-            
-            # Only the per-position function changes; retain the exact reduction.
-            q1_diff = q1_values - td_targets
-            q2_diff = q2_values - td_targets
-            q1_huber = self._critic_position_error(q1_diff)
-            q2_huber = self._critic_position_error(q2_diff)
-            critic_loss = ((mask * q1_huber).sum() + (mask * q2_huber).sum()) / (2 * mask_sum)
-            
-            self.policy.critic.optimizer.zero_grad()
-            critic_loss.backward()
-            
-            critic_grad_norm = torch.nn.utils.clip_grad_norm_(critic_clip, 1.0)
-            self.policy.critic.optimizer.step()
-
-            # Both modules register the same encoder. SAC actor gradients stop at
-            # its features. Only the auxiliary loss may update it in "both" mode.
-            self.policy.critic.requires_grad_(False)
-            try:
-                self.policy.shared_cnn.requires_grad_(aux_updates_encoder)
-                obs_features_cached = self.policy.extract_cnn_features(context_obs)
-                if aux_updates_encoder:
-                    aux_cnn_features = obs_features_cached
-                    obs_features_cached = obs_features_cached.detach().requires_grad_(True)
-
-                # Actor samples new actions using cached features
-                if use_aux:
-                    actions_pi, log_probs, context = self._sample_history_actions(
-                        obs_features_cached, context_obs['state'], history_lengths, return_context=True, plan=plan
-                    )
-                else:
-                    actions_pi, log_probs = self._sample_history_actions(
-                        obs_features_cached, context_obs['state'], history_lengths, plan=plan
-                    )
-                # Clip log_probs to prevent extreme values
-                log_probs = log_probs.clamp(-20, 20)
-            
-                # Critic evaluates actor's scaled actions using cached features
-                q1_pi, q2_pi = self._critic_history_values(
-                    self.policy.critic, obs_features_cached, context_obs['state'], actions_pi, history_lengths, plan=plan
-                )
-                min_q_pi = torch.min(q1_pi, q2_pi).clamp(-300, 300)
-            
-                actor_loss = (mask * (ent_coef * log_probs - min_q_pi)).sum() / mask_sum
-                if use_aux:
-                    aux_loss = self._compute_aux_loss(context, batch)
-                    actor_loss = actor_loss + self.policy.aux_weight * aux_loss
-                    if aux_updates_encoder:
-                        aux_feature_grad, = torch.autograd.grad(
-                            self.policy.aux_weight * aux_loss, obs_features_cached, retain_graph=True,
-                        )
-
-                self.policy.actor.optimizer.zero_grad()
-                actor_loss.backward()
-                if aux_updates_encoder:
-                    aux_cnn_features.backward(aux_feature_grad)
-
-                actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor_clip, 1.0)
-                self.policy.actor.optimizer.step()
-            finally:
-                self.policy.critic.requires_grad_(True)
-
-            # ========== Entropy Coefficient Update ==========
-            if self.log_ent_coef is not None:
-                # log_probs already detached implicitly since actor update is done
-                ent_coef_loss = -(self.log_ent_coef * (mask * (log_probs.detach() + self.target_entropy))).sum() / mask_sum
-                
-                self.ent_coef_optimizer.zero_grad()
-                ent_coef_loss.backward()
-                self.ent_coef_optimizer.step()
-            
-            # ========== Target Network Update ==========
-            # critic_target owns target_cnn, so its parameters are updated here too.
-            polyak_update(self.policy.critic.parameters(), self.policy.critic_target.parameters(), self.tau)
-
-            # Reduce diagnostics on-device. Transfer the scalar rows together
-            # after all gradient steps, independently of the training graph.
-            with torch.no_grad():
-                q_mean = (q1_values + q2_values) / 2
-
-                def masked_mean(values):
-                    return (values * mask).sum().double() / mask_sum
-
-                metrics = {
-                    'actor_losses': actor_loss, 'critic_losses': critic_loss,
-                    'q_values_list': masked_mean(q_mean), 'q_max_list': q_mean.max(),
-                    'q_min_list': q_mean.min(), 'td_errors_list': masked_mean((q1_diff.abs() + q2_diff.abs()) / 2),
-                    'log_probs_list': masked_mean(log_probs),
-                    'action_magnitudes': masked_mean(actions_pi.abs().mean(dim=-1)),
-                    'critic_grad_norms': critic_grad_norm, 'actor_grad_norms': actor_grad_norm,
-                    'mask_sums': mask_sum,
-                }
-                if use_aux:
-                    metrics['aux_loss'] = aux_loss
-                if self.log_ent_coef is not None:
-                    metrics['ent_coef_losses'] = ent_coef_loss
-                metric_rows.append(torch.stack(list(metrics.values())))
+            metrics = self._train_batch(batch, use_aux, aux_updates_encoder, critic_clip, actor_clip)
+            metric_rows.append(torch.stack(list(metrics.values())))
+            self._n_updates += 1
 
         if metric_rows:
             columns = torch.stack(metric_rows).T.cpu().tolist()
             summary = dict(zip(metrics, columns))
             if use_aux:
                 self.logger.record('train/aux_loss', np.mean(summary.pop('aux_loss')))
+            if "demo_action_loss" in summary:
+                self.logger.record("train/demo_action_loss", np.mean(summary.pop("demo_action_loss")))
             summary.setdefault('ent_coef_losses', [])
             record_mamba_training_metrics(logger=self.logger, ent_coef=self.ent_coef, **summary)
+            self.logger.record('train/n_updates', self._n_updates)
+
+    def _train_batch(self, batch, use_aux, aux_updates_encoder, critic_clip, actor_clip):
+        """Apply one critic, actor, entropy and target update to already sampled data."""
+        actions = batch['actions']  # (B, T, action_dim) - SCALED (actual values from env)
+        mask = batch['mask']  # (B, T)
+        context_obs = batch['context_observations']
+        history_lengths = batch['history_lengths']
+        plan = self._window_indices(history_lengths, mask.device)
+
+        # Defensive fix for resumed checkpoints: keep entropy tensor/optimizer on train device.
+        if self.log_ent_coef is not None and self.log_ent_coef.device != mask.device:
+            self.log_ent_coef.data.copy_(self.log_ent_coef.data.to(mask.device))
+            self._move_optimizer_state_to_device(self.ent_coef_optimizer, mask.device)
+
+        ent_coef = self.log_ent_coef.detach().exp() if self.log_ent_coef is not None else self.ent_coef
+        mask_sum = mask.sum().clamp(min=1.0)  # Avoid division by zero
+
+        # ========== Critic Update ==========
+        # Both paths see the same online weights before the critic update.
+        # The target critic still encodes its input with its own Polyak CNN.
+        critic_features = self.policy.extract_cnn_features(context_obs)
+        td_targets = self._compute_td_targets(batch, ent_coef, critic_features.detach())
+        q1_values, q2_values = self._critic_history_values(
+            self.policy.critic, critic_features, context_obs['state'], actions, history_lengths, plan=plan,
+        )
+
+        # Clip Q values to prevent explosion during training
+        q1_values = q1_values.clamp(-self.q_value_bound, self.q_value_bound)
+        q2_values = q2_values.clamp(-self.q_value_bound, self.q_value_bound)
+
+        # Only the per-position function changes; retain the exact reduction.
+        q1_diff = q1_values - td_targets
+        q2_diff = q2_values - td_targets
+        q1_huber = self._critic_position_error(q1_diff)
+        q2_huber = self._critic_position_error(q2_diff)
+        critic_loss = ((mask * q1_huber).sum() + (mask * q2_huber).sum()) / (2 * mask_sum)
+
+        self.policy.critic.optimizer.zero_grad()
+        critic_loss.backward()
+
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(critic_clip, 1.0)
+        self.policy.critic.optimizer.step()
+
+        # Both modules register the same encoder. SAC actor gradients stop at
+        # its features. Only the auxiliary loss may update it in "both" mode.
+        self.policy.critic.requires_grad_(False)
+        try:
+            self.policy.shared_cnn.requires_grad_(aux_updates_encoder)
+            obs_features_cached = self.policy.extract_cnn_features(context_obs)
+            if aux_updates_encoder:
+                aux_cnn_features = obs_features_cached
+                obs_features_cached = obs_features_cached.detach().requires_grad_(True)
+
+            # Actor samples new actions using cached features
+            if use_aux or self.demo_action_anchor is not None:
+                actions_pi, log_probs, context = self._sample_history_actions(
+                    obs_features_cached, context_obs['state'], history_lengths, return_context=True, plan=plan
+                )
+            else:
+                actions_pi, log_probs = self._sample_history_actions(
+                    obs_features_cached, context_obs['state'], history_lengths, plan=plan
+                )
+            # Clip log_probs to prevent extreme values
+            log_probs = log_probs.clamp(-20, 20)
+
+            # Critic parameters are frozen. Post-update observation context is
+            # shared by both Q heads. Only the path from Q to actions is needed.
+            q1_pi, q2_pi = self._critic_history_values(
+                self.policy.critic, obs_features_cached.detach(), context_obs['state'], actions_pi,
+                history_lengths, plan=plan,
+            )
+            min_q_pi = torch.min(q1_pi, q2_pi).clamp(-300, 300)
+
+            actor_loss = (mask * (ent_coef * log_probs - min_q_pi)).sum() / mask_sum
+            if self.demo_action_anchor is not None:
+                demo_loss = self._demo_action_loss(context, actions, mask, batch["episode_indices"],
+                                                   batch["steps_remaining"])
+                actor_loss = actor_loss + demo_loss
+            if use_aux:
+                aux_loss = self._compute_aux_loss(context, batch)
+                actor_loss = actor_loss + self.policy.aux_weight * aux_loss
+                if aux_updates_encoder:
+                    aux_feature_grad, = torch.autograd.grad(
+                        self.policy.aux_weight * aux_loss, obs_features_cached, retain_graph=True,
+                    )
+
+            self.policy.actor.optimizer.zero_grad()
+            actor_loss.backward()
+            if aux_updates_encoder:
+                aux_cnn_features.backward(aux_feature_grad)
+
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor_clip, 1.0)
+            self.policy.actor.optimizer.step()
+        finally:
+            self.policy.critic.requires_grad_(True)
+
+        # ========== Entropy Coefficient Update ==========
+        if self.log_ent_coef is not None:
+            # log_probs already detached implicitly since actor update is done
+            ent_coef_loss = -(self.log_ent_coef * (mask * (log_probs.detach() + self.target_entropy))).sum() / mask_sum
+
+            self.ent_coef_optimizer.zero_grad()
+            ent_coef_loss.backward()
+            self.ent_coef_optimizer.step()
+
+        # ========== Target Network Update ==========
+        # critic_target owns target_cnn, so its parameters are updated here too.
+        polyak_update(self.policy.critic.parameters(), self.policy.critic_target.parameters(), self.tau)
+
+        # Reduce diagnostics on-device. Transfer the scalar rows together
+        # after all gradient steps, independently of the training graph.
+        with torch.no_grad():
+            q_mean = (q1_values + q2_values) / 2
+
+            def masked_mean(values):
+                return (values * mask).sum().double() / mask_sum
+
+            metrics = {
+                'actor_losses': actor_loss, 'critic_losses': critic_loss,
+                'q_values_list': masked_mean(q_mean), 'q_max_list': q_mean.max(),
+                'q_min_list': q_mean.min(), 'td_errors_list': masked_mean((q1_diff.abs() + q2_diff.abs()) / 2),
+                'log_probs_list': masked_mean(log_probs),
+                'action_magnitudes': masked_mean(actions_pi.abs().mean(dim=-1)),
+                'critic_grad_norms': critic_grad_norm, 'actor_grad_norms': actor_grad_norm,
+                'mask_sums': mask_sum,
+            }
+            if use_aux:
+                metrics['aux_loss'] = aux_loss
+            if self.demo_action_anchor is not None:
+                metrics["demo_action_loss"] = demo_loss
+            if self.log_ent_coef is not None:
+                metrics['ent_coef_losses'] = ent_coef_loss
+        return metrics
+
+    def _demo_action_loss(self, context, actions, mask, episode_indices, steps_remaining):
+        """Anchor only the deterministic action, leaving SAC entropy adaptive."""
+        roofed_end, demo_end, roofed_weight, corridor_weight = self.demo_action_anchor
+        roofed = episode_indices < roofed_end
+        corridor = (episode_indices >= roofed_end) & (episode_indices < demo_end)
+        row_weight = roofed * roofed_weight + corridor * corridor_weight
+        actor = self.policy.actor
+        means, _ = actor.distribution_parameters(context)
+        squared_error = (means.tanh() - actor.unscale_action(actions)).square()
+        demo_steps = ((roofed | corridor)[:, None] * mask).sum().clamp_min(1)
+        loss = (squared_error.mean(dim=-1) * mask * row_weight[:, None]).sum() / demo_steps
+        if self.demo_terminal_altitude_weight > 0:
+            finish = mask * corridor[:, None] * (steps_remaining <= 40)
+            finish_loss = (squared_error[..., 1] * finish).sum() / finish.sum().clamp_min(1)
+            loss = loss + self.demo_terminal_altitude_weight * finish_loss
+        precision_weight = getattr(self, "demo_terminal_precision_weight", 0.0)
+        if precision_weight > 0:
+            finish_all = mask * (roofed | corridor)[:, None] * (steps_remaining <= 50)
+            finish_all_loss = (squared_error.mean(dim=-1) * finish_all).sum() / finish_all.sum().clamp_min(1)
+            loss = loss + precision_weight * finish_all_loss
+        return loss
+
+    def _updates_due(self):
+        previous = max(self.num_timesteps, self.learning_starts)
+        following = self.num_timesteps + self.n_envs
+        return max(0, following // self.train_freq - previous // self.train_freq)
+
+    def _replay_ready(self):
+        return bool(self.replay_buffer.episodes) and self.replay_buffer.size() >= self.batch_size * self.seq_len
+
+    def _can_overlap_updates(self):
+        if not self._replay_ready():
+            return False
+        replay = self.replay_buffer
+        # If adding the batch can evict episodes, their maximum length bounds
+        # the drop in replay size. Keep marginal cases on the synchronous path.
+        max_episode = min(replay.buffer_size // 2, 10000)
+        return (replay.size() + self.n_envs <= replay.buffer_size
+                or self.batch_size * self.seq_len <= replay.buffer_size - max_episode)
+
+    def _step_and_update(self, action, updates):
+        """Use committed replay while other processes advance the next vector batch."""
+        if not (self.n_envs > 1 and self.overlap_updates and updates and self._can_overlap_updates()):
+            return self.env.step(action), updates
+
+        self.env.step_async(action)
+        try:
+            for _ in range(updates):
+                self.train(self.gradient_steps, self.batch_size)
+        except BaseException as exc:
+            try:
+                self.env.step_wait()
+            except Exception as wait_error:
+                exc.add_note(f"AirSim step also failed while unwinding: {wait_error!r}")
+            raise
+        return self.env.step_wait(), 0
 
     def learn(
         self,
@@ -476,20 +552,26 @@ class MambaSAC(BaseAlgorithm):
         progress_bar: bool = False,
     ):
         """Collect experience and train."""
+        if self.overlap_updates and self.n_envs > 1 and total_timesteps % self.n_envs:
+            raise ValueError("Overlapped training requires a budget divisible by the number of environments")
+
         pending = getattr(self, '_pending_random_state', None)
         if pending is not None:
             self._restore_random_state(pending)
-            monitor = self.env.envs[0]
-            if hasattr(monitor, 'pending_reset_origin') and 'environment' in pending:
-                monitor.pending_reset_origin = pending.get('episode_reset_origin', {
-                    'seed': None, 'rng': pending['environment'],
-                })
+            if self.n_envs == 1 and hasattr(self.env, "envs"):
+                monitor = self.env.envs[0]
+                if hasattr(monitor, 'pending_reset_origin') and 'environment' in pending:
+                    monitor.pending_reset_origin = pending.get('episode_reset_origin', {
+                        'seed': None, 'rng': pending['environment'],
+                    })
             self._last_obs = None
         starting_episode = reset_num_timesteps or self._last_obs is None
-        if starting_episode and self._last_obs is not None and self.replay_buffer.current_episode is not None:
-            # A fresh learn() reset truncates any unfinished segment from this process.
-            self.replay_buffer.current_episode.set_final_obs({k: v[0].copy() for k, v in self._last_obs.items()})
-            self.replay_buffer._finish_episode()
+        if starting_episode and self._last_obs is not None:
+            # A fresh learn() reset truncates unfinished segments from this process.
+            for env_idx, episode in enumerate(self.replay_buffer._active_episodes):
+                if episode is not None:
+                    episode.set_final_obs({key: value[env_idx].copy() for key, value in self._last_obs.items()})
+                    self.replay_buffer._finish_episode(env_idx)
         total_timesteps, callback = self._setup_learn(
             total_timesteps,
             callback,
@@ -507,79 +589,64 @@ class MambaSAC(BaseAlgorithm):
         # Episode tracking for logging
         episode_rewards = []
         episode_lengths = []
-        current_episode_reward, current_episode_length = (
-            (0.0, 0) if starting_episode else self._rollout_episode_progress
-        )
+        if starting_episode:
+            episode_progress = [(0.0, 0)] * self.n_envs
+        elif self.n_envs == 1:
+            episode_progress = [self._rollout_episode_progress]
+        else:
+            episode_progress = self._rollout_episode_progress.copy()
         
         while self.num_timesteps < total_timesteps:
             # Select action
             if self.num_timesteps < self.learning_starts:
-                action = np.array([self.action_space.sample()])
+                action = np.stack([self.action_space.sample() for _ in range(self.n_envs)])
             else:
                 action, _ = self.predict(obs, deterministic=False, use_history=True)
 
-            # Step environment (VecEnv returns 4 values: obs, reward, done, info)
-            next_obs, rewards, dones, infos = self.env.step(action)
-            
-            reward = rewards[0]
-            done = dones[0]
-            info = infos[0]
-            
-            # Check if this is a true termination or just truncation (timeout)
-            # Truncation allows Critic to bootstrap, termination does not
-            truncated = info.get('TimeLimit.truncated', False)
-            terminated = done and not truncated
-            
-            # CRITICAL: VecEnv auto-resets on done, so next_obs is the NEW episode's first obs
-            # The TRUE terminal observation is stored in info['terminal_observation']
-            # We must use terminal_observation for proper TD bootstrap on truncation
-            if done and 'terminal_observation' in info:
-                # Use the actual terminal observation, not the reset observation
-                terminal_obs = info['terminal_observation']
-                # terminal_observation is a dict for Dict obs space
-                if isinstance(terminal_obs, dict):
-                    actual_next_obs = {k: v for k, v in terminal_obs.items()}
+            # An overlapped update samples completed episodes from the previous
+            # committed batch. A batch that makes replay ready trains after insertion.
+            result, remaining_updates = self._step_and_update(action, self._updates_due())
+            next_obs, rewards, dones, infos = result
+            previous_episode_num = self._episode_num
+            for env_idx, (reward, done, info) in enumerate(zip(rewards, dones, infos, strict=True)):
+                terminated = done and not info.get('TimeLimit.truncated', False)
+                # VecEnv auto-resets. A timeout must bootstrap from the true terminal observation.
+                actual_next_obs = info.get('terminal_observation') if done else None
+                if not isinstance(actual_next_obs, dict):
+                    actual_next_obs = {key: value[env_idx] for key, value in next_obs.items()}
+                self.replay_buffer.add(
+                    obs={key: value[env_idx] for key, value in obs.items()},
+                    next_obs=actual_next_obs,
+                    action=info.get("stage3_guided_action", action[env_idx]),
+                    reward=float(reward),
+                    done=terminated,
+                    infos=info,
+                    env_idx=env_idx,
+                )
+
+                episode_reward, episode_length = episode_progress[env_idx]
+                episode_reward += reward
+                episode_length += 1
+                if done:
+                    self._episode_num += 1
+                    episode_rewards.append(episode_reward)
+                    episode_lengths.append(episode_length)
+                    episode_progress[env_idx] = (0.0, 0)
                 else:
-                    actual_next_obs = {k: v[0] for k, v in next_obs.items()}
-            else:
-                actual_next_obs = {k: v[0] for k, v in next_obs.items()}
-            
-            # Store the policy output action exactly as the environment receives it.
-            # The executed action equals action[0] in the current direct-control setup.
-            # Critic, actor, and replay buffer all use the same action representation.
-            # Reward and transition are therefore aligned on that action space.
-            stored_action = action[0]
-            
-            # Store transition (unbatch obs for buffer)
-            self.replay_buffer.add(
-                obs={k: v[0] for k, v in obs.items()},
-                next_obs=actual_next_obs,
-                action=stored_action,
-                reward=float(reward),
-                done=terminated,  # Only true terminations, not truncations
-                infos=info,
-            )
-            
+                    episode_progress[env_idx] = (episode_reward, episode_length)
+
             obs = next_obs
             self._last_obs = obs
             self._last_episode_starts = dones.copy()
-            self.num_timesteps += 1
-            current_episode_reward += reward
-            current_episode_length += 1
-            
-            # Reset handled automatically by VecEnv
-            if done:
-                self._episode_num += 1
-                episode_rewards.append(current_episode_reward)
-                episode_lengths.append(current_episode_length)
-                current_episode_reward = 0.0
-                current_episode_length = 0
-                # Reset actor history for new episode
+            self.num_timesteps += self.n_envs
+            done_indices = np.flatnonzero(dones)
+            if done_indices.size == self.n_envs:
                 self.policy.actor.reset_history()
-            
-            # Train
-            if self.num_timesteps > self.learning_starts and self.num_timesteps % self.train_freq == 0:
-                if self.replay_buffer.size() >= self.batch_size * self.seq_len:
+            elif done_indices.size:
+                self.policy.actor.reset_history(done_indices)
+
+            if remaining_updates and self._replay_ready():
+                for _ in range(remaining_updates):
                     self.train(self.gradient_steps, self.batch_size)
             
             # Callback
@@ -588,7 +655,8 @@ class MambaSAC(BaseAlgorithm):
                 break
             
             # Logging - only when episode ends and at log_interval
-            if done and log_interval is not None and self._episode_num % log_interval == 0:
+            if (done_indices.size and log_interval is not None
+                    and previous_episode_num // log_interval < self._episode_num // log_interval):
                 record_mamba_rollout_metrics(
                     logger=self.logger,
                     episode_num=self._episode_num,
@@ -599,7 +667,7 @@ class MambaSAC(BaseAlgorithm):
                 )
                 self.logger.dump(step=self.num_timesteps)
         
-        self._rollout_episode_progress = current_episode_reward, current_episode_length
+        self._rollout_episode_progress = episode_progress[0] if self.n_envs == 1 else episode_progress
         callback.on_training_end()
         return self
     
@@ -617,7 +685,7 @@ class MambaSAC(BaseAlgorithm):
         Args:
             observation: Current observation
             state: Not used (kept for API compatibility)
-            episode_start: If True, reset history buffer for new episode
+            episode_start: Boolean flag or mask of environments starting a new episode
             deterministic: Whether to use deterministic action
             use_history: Whether to use the actor's inference history buffer
         
@@ -625,10 +693,6 @@ class MambaSAC(BaseAlgorithm):
             action: Selected action
             state: None (kept for API compatibility)
         """
-        # Reset history at episode start
-        if episode_start is not None and np.any(episode_start):
-            self.policy.actor.reset_history()
-        
         with torch.no_grad():
             # Check if observation is already batched (from VecEnv)
             first_key = next(iter(observation))
@@ -640,7 +704,16 @@ class MambaSAC(BaseAlgorithm):
             if not is_batched:
                 obs_tensor = {key: val.unsqueeze(0) for key, val in obs_tensor.items()}
 
-            action = self.policy.actor(
+            actor = self.policy.actor
+            if episode_start is not None:
+                mask = np.asarray(episode_start, dtype=bool)
+                if mask.any():
+                    if mask.all():
+                        actor.reset_history()
+                    elif actor._history_lens is None or actor._history_lens.size == obs_tensor['image'].shape[0]:
+                        actor.reset_history(np.flatnonzero(mask))
+
+            action = actor(
                 obs_tensor,
                 deterministic=deterministic,
                 use_history=use_history,
@@ -672,6 +745,7 @@ class MambaSAC(BaseAlgorithm):
             # Training progress
             'num_timesteps': self.num_timesteps,
             '_episode_num': self._episode_num,
+            '_n_updates': self._n_updates,
             # Config for validation
             'seq_len': self.seq_len,
             'batch_size': self.batch_size,
@@ -685,10 +759,16 @@ class MambaSAC(BaseAlgorithm):
         if include_buffer:
             checkpoint['replay_buffer'] = self.replay_buffer.get_state()
             checkpoint['random_state'] = self._capture_random_state()
-            if self.replay_buffer.current_episode is not None and isinstance(self._last_obs, dict):
-                checkpoint['continuation_observation'] = {
-                    key: np.array(value[0], copy=True) for key, value in self._last_obs.items()
-                }
+            if isinstance(self._last_obs, dict):
+                continuations = [
+                    {key: value[env_idx].copy() for key, value in self._last_obs.items()}
+                    if episode is not None else None
+                    for env_idx, episode in enumerate(self.replay_buffer._active_episodes)
+                ]
+                if any(obs is not None for obs in continuations):
+                    checkpoint['continuation_observations'] = continuations
+                    if continuations[0] is not None:
+                        checkpoint['continuation_observation'] = continuations[0]
         
         torch.save(checkpoint, path + '.zip')
 
@@ -701,12 +781,14 @@ class MambaSAC(BaseAlgorithm):
         }
         if torch.cuda.is_available():
             state['torch_cuda'] = torch.cuda.get_rng_state_all()
-        if self.env is not None:
+        if self.n_envs == 1 and hasattr(self.env, "envs"):
             monitor = self.env.envs[0]
             state['environment'] = monitor.unwrapped.np_random.bit_generator.state
             origin = getattr(monitor, 'reset_origin', None)
             if origin is not None and np.any(self._last_episode_starts) and self.replay_buffer.current_episode is None:
                 state['episode_reset_origin'] = origin
+        elif self.env is not None:
+            state['environments'] = [rng.bit_generator.state for rng in self.env.get_attr('np_random')]
         return state
 
     def _restore_random_state(self, state: dict) -> None:
@@ -716,8 +798,17 @@ class MambaSAC(BaseAlgorithm):
         self.action_space.np_random.bit_generator.state = state['action_space']
         if 'torch_cuda' in state and torch.cuda.is_available():
             torch.cuda.set_rng_state_all([value.cpu() for value in state['torch_cuda']])
-        if 'environment' in state and self.env is not None:
+        if 'environment' in state and self.n_envs == 1 and hasattr(self.env, "envs"):
             self.env.envs[0].unwrapped.np_random.bit_generator.state = state['environment']
+        elif self.env is not None:
+            env_states = state.get('environments', [state['environment']] if 'environment' in state else [])
+            if len(env_states) == self.n_envs:
+                generators = self.env.get_attr('np_random')
+                for env_idx, (rng, rng_state) in enumerate(zip(generators, env_states, strict=True)):
+                    rng.bit_generator.state = rng_state
+                    self.env.set_attr('np_random', rng, indices=env_idx)
+                # A queued seed would overwrite the restored generator on the next reset.
+                self.env.unwrapped._reset_seeds()
     
     def save_full_checkpoint(self, path: str) -> None:
         """Save full checkpoint including replay buffer for true resume."""
@@ -780,20 +871,13 @@ class MambaSAC(BaseAlgorithm):
         # Load training progress
         model.num_timesteps = checkpoint.get('num_timesteps', 0)
         model._episode_num = checkpoint.get('_episode_num', 0)
+        model._n_updates = checkpoint.get('_n_updates', 0)
         
         # Load replay buffer if available and requested
         if load_buffer and 'replay_buffer' in checkpoint:
-            model.replay_buffer.set_state(checkpoint['replay_buffer'])
-            if model.replay_buffer.current_episode is not None:
-                continuation = checkpoint.get('continuation_observation')
-                if continuation is not None:
-                    model.replay_buffer.current_episode.set_final_obs(continuation)
-                    model.replay_buffer._finish_episode()
-                else:
-                    # Older snapshots lack the last transition's next observation.
-                    model.replay_buffer.total_transitions -= model.replay_buffer.current_episode.length
-                    model.replay_buffer.current_episode = None
-                    print('  Discarded incomplete replay episode without next observation')
+            continuations = checkpoint.get('continuation_observations', [checkpoint.get('continuation_observation')])
+            # The new simulator sessions reset. Seal saved segments with their own bootstrap observations.
+            model.replay_buffer.set_state(checkpoint['replay_buffer'], continuation_observations=continuations)
             model._pending_random_state = checkpoint.get('random_state')
             print(f"  Replay buffer restored: {model.replay_buffer.size()} transitions")
         else:

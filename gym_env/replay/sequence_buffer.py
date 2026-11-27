@@ -126,6 +126,7 @@ class SequenceReplayBuffer:
         self.observation_space = observation_space
         self.action_space = action_space
         self.seq_len = seq_len
+        self.n_envs = max(1, int(n_envs))
 
         if device == "auto":
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -134,7 +135,7 @@ class SequenceReplayBuffer:
 
         # Episode storage
         self.episodes: deque = deque()
-        self.current_episode: Optional[EpisodeStorage] = None
+        self._active_episodes: List[Optional[EpisodeStorage]] = [None] * self.n_envs
         self.total_transitions = 0
 
         # Index for efficient sampling: (episode_idx, start_idx) pairs
@@ -142,6 +143,14 @@ class SequenceReplayBuffer:
         self.valid_starts: List[Tuple[int, int]] = []
         self._next_ep_idx = 0        # Global Episode counter (never resets)
         self._min_valid_ep_idx = 0   # Lowest ep_idx still alive in deque
+
+    @property
+    def current_episode(self) -> Optional[EpisodeStorage]:
+        return self._active_episodes[0]
+
+    @current_episode.setter
+    def current_episode(self, episode: Optional[EpisodeStorage]) -> None:
+        self._active_episodes[0] = episode
 
     def add(
         self,
@@ -151,6 +160,7 @@ class SequenceReplayBuffer:
         reward: float,
         done: bool,
         infos: Optional[Dict] = None,
+        env_idx: int = 0,
     ):
         """
         Add a transition to the buffer.
@@ -163,21 +173,24 @@ class SequenceReplayBuffer:
             done: True ONLY for true terminations (crash/success/outside).
                   False for truncations (timeout) - allows Critic to bootstrap.
             infos: Must contain 'TimeLimit.truncated' for truncated episodes.
+            env_idx: Environment that produced this transition.
 
         Episode boundary handling:
         - True termination (done=True): episode ends, no bootstrap (next_obs not needed)
         - Truncation (TimeLimit.truncated=True): episode ends, next_obs stored for bootstrap
         """
-        # Start new episode if needed
-        if self.current_episode is None:
-            self.current_episode = EpisodeStorage()
+        if not 0 <= env_idx < self.n_envs:
+            raise IndexError(f"Invalid replay environment index: {env_idx}")
+        episode = self._active_episodes[env_idx]
+        if episode is None:
+            episode = self._active_episodes[env_idx] = EpisodeStorage()
 
         # Check if this is a truncation (timeout) - episode ends but allows bootstrap
         truncated = infos.get('TimeLimit.truncated', False) if infos else False
 
         # Add transition
         # done=True only for true terminations, False for truncations (allows bootstrap)
-        self.current_episode.add(obs, action, reward, done)
+        episode.add(obs, action, reward, done)
         self.total_transitions += 1
 
         # End episode on ANY done condition (termination OR truncation)
@@ -187,18 +200,18 @@ class SequenceReplayBuffer:
             # With action_repeat the transition reward may include earlier dense rewards.
             terminal = (infos or {}).get('reward_components', {}).get('terminal')
             if done and terminal is not None and terminal != reward:
-                self.current_episode.terminal_reward = float(terminal)
+                episode.terminal_reward = float(terminal)
             # For truncated episodes, store next_obs for proper bootstrap
             if truncated and not done:
-                self.current_episode.set_final_obs(next_obs)
-            self._finish_episode()
+                episode.set_final_obs(next_obs)
+            self._finish_episode(env_idx)
 
         # Safety: force finish if current episode is too long (prevents memory issues)
         # This shouldn't happen with proper TimeLimit wrapper, but adds robustness
         max_episode_len = min(self.buffer_size // 2, 10000)  # Cap at half buffer or 10k steps
-        if self.current_episode is not None and self.current_episode.length >= max_episode_len:
+        if not episode_ended and episode.length >= max_episode_len:
             print(f"Warning: Episode exceeded {max_episode_len} steps, forcing finish")
-            self._finish_episode()
+            self._finish_episode(env_idx)
 
         # Remove old episodes if over capacity
         while self.total_transitions > self.buffer_size and len(self.episodes) > 1:
@@ -206,20 +219,26 @@ class SequenceReplayBuffer:
             self.total_transitions -= removed.length
             self._min_valid_ep_idx += 1
 
-    def _finish_episode(self):
-        """Finish current episode and add to buffer."""
-        if self.current_episode is not None and self.current_episode.length > 0:
+    def _finish_episode(self, env_idx: int = 0):
+        """Finish an environment's active episode and make it available to sample."""
+        if not 0 <= env_idx < self.n_envs:
+            raise IndexError(f"Invalid replay environment index: {env_idx}")
+        self._store_episode(self._active_episodes[env_idx])
+        self._active_episodes[env_idx] = None
+
+    def _store_episode(self, episode: Optional[EpisodeStorage]) -> None:
+        if episode is not None and episode.length > 0:
             ep_idx = self._next_ep_idx
             self._next_ep_idx += 1
-            self.episodes.append(self.current_episode)
-            # Register valid starting positions with global ep_idx
-            for start in range(self.current_episode.length):
+            self.episodes.append(episode)
+            for start in range(episode.length):
                 self.valid_starts.append((ep_idx, start))
-        self.current_episode = None
 
     def sample(self, batch_size: int, history_len: int = 8, *,
                compact: bool = False, failure_horizon: Optional[int] = None,
-               failure_rewards: Tuple[float, float] = (-25.0, -20.0)) -> Dict[str, torch.Tensor]:
+               failure_rewards: Tuple[float, float] = (-25.0, -20.0),
+               include_episode_indices: bool = False,
+               demo_prefix: Optional[Tuple[int, float]] = None) -> Dict[str, torch.Tensor]:
         """
         Sample a batch of sequences. Training can request compact=True to
         transfer one native-dtype context and keep grouping lengths on CPU.
@@ -236,6 +255,7 @@ class SequenceReplayBuffer:
             - context_observations: (batch, history_len + seq_len, ...)
             - history_lengths: (batch, seq_len), actual episode-local history
             - failure_targets, failure_mask: optional finite-horizon labels
+            - episode_indices, steps_remaining: optional replay episode identities and positions
         """
         if failure_horizon is not None and failure_horizon < 1:
             raise ValueError("failure_horizon must be positive")
@@ -250,7 +270,22 @@ class SequenceReplayBuffer:
         population = len(self.valid_starts) - first_live
         if not population:
             raise ValueError("No valid data in buffer")
-        indices = np.random.choice(population, batch_size, replace=population < batch_size)
+        if demo_prefix is None:
+            indices = np.random.choice(population, batch_size, replace=population < batch_size)
+        else:
+            end, fraction = demo_prefix
+            demonstrations = bisect_left(self.valid_starts, (end,), first_live) - first_live
+            online = population - demonstrations
+            if not demonstrations or not online:
+                indices = np.random.choice(population, batch_size, replace=population < batch_size)
+            else:
+                demo_count = round(batch_size * fraction)
+                regular_count = batch_size - demo_count
+                indices = np.concatenate((
+                    np.random.choice(demonstrations, demo_count, replace=demonstrations < demo_count),
+                    demonstrations + np.random.choice(online, regular_count, replace=online < regular_count),
+                ))
+                np.random.shuffle(indices)
 
         shape = (batch_size, self.seq_len)
 
@@ -267,16 +302,23 @@ class SequenceReplayBuffer:
         dones = np.ones(shape, np.float32)
         mask = np.zeros(shape, np.float32)
         lengths = np.empty(shape, np.int64)
+        if include_episode_indices:
+            episode_indices = np.empty(batch_size, np.int64)
+            steps_remaining = np.zeros(shape, np.int64)
         if failure_horizon is not None:
             failure_targets = np.zeros((*shape, len(failure_rewards)), np.float32)
             failure_mask = np.zeros(shape, np.float32)
 
         for row, index in enumerate(indices):
             ep_idx, start_idx = self.valid_starts[first_live + index]
+            if include_episode_indices:
+                episode_indices[row] = ep_idx
             episode = self.episodes[ep_idx - self._min_valid_ep_idx]
             end = min(start_idx + self.seq_len, episode.length)
             actual_len = end - start_idx
             valid = slice(0, actual_len)
+            if include_episode_indices:
+                steps_remaining[row, valid] = episode.length - (start_idx + np.arange(actual_len))
             frames = episode.read_context(start_idx, end, history_len, self.seq_len - actual_len)
             for key, sequence in frames.items():
                 context[key][row] = sequence
@@ -310,6 +352,9 @@ class SequenceReplayBuffer:
                           'mask': mask})
         result['history_lengths'] = torch.as_tensor(lengths, device='cpu' if compact else self.device)
         result['context_observations'] = tensors(context)
+        if include_episode_indices:
+            result['episode_indices'] = torch.as_tensor(episode_indices, device=self.device)
+            result['steps_remaining'] = torch.as_tensor(steps_remaining, device=self.device)
         if not compact:
             result.update(observations=tensors(observations), next_observations=tensors(next_observations))
         if failure_horizon is not None:
@@ -330,35 +375,40 @@ class SequenceReplayBuffer:
         Returns:
             Dict containing all buffer data and indices for serialization.
         """
+        active = [ep.get_state() if ep is not None else None for ep in self._active_episodes]
         return {
             'episodes': [episode.get_state() for episode in self.episodes],
-            'current_episode': self.current_episode.get_state() if self.current_episode is not None else None,
+            'active_episodes': active,
+            'current_episode': active[0],
             'total_transitions': self.total_transitions,
             'valid_starts': self.valid_starts,
             'next_ep_idx': self._next_ep_idx,
             'min_valid_ep_idx': self._min_valid_ep_idx,
         }
 
-    def set_state(self, state: Dict) -> None:
+    def set_state(self, state: Dict, *, continuation_observations=None) -> None:
         """
         Restore buffer state from checkpoint.
 
         Args:
             state: Dict from get_state()
+            continuation_observations: If supplied, close each saved active episode
+                with its last next observation before collecting from reset environments.
         """
+        saved_active = state.get('active_episodes', [state.get('current_episode')])
+        active = [EpisodeStorage.from_state(data) if data is not None else None for data in saved_active]
+        if continuation_observations is None and any(active[self.n_envs:]):
+            raise ValueError("Replay checkpoint contains active episodes beyond the available environment slots")
         self.episodes = deque(EpisodeStorage.from_state(data) for data in state['episodes'])
-        current = state['current_episode']
-        self.current_episode = EpisodeStorage.from_state(current) if current is not None else None
         self.valid_starts = []
 
         # Restore counters/indices (with backward compatibility for old checkpoints)
         if 'total_transitions' in state:
             self.total_transitions = int(state['total_transitions'])
         else:
-            total = sum(ep.length for ep in self.episodes)
-            if self.current_episode is not None:
-                total += self.current_episode.length
-            self.total_transitions = total
+            self.total_transitions = sum(ep.length for ep in self.episodes) + sum(
+                ep.length for ep in active if ep is not None
+            )
 
         self._next_ep_idx = int(state.get('next_ep_idx', len(self.episodes)))
         self._min_valid_ep_idx = int(state.get('min_valid_ep_idx', 0))
@@ -380,6 +430,20 @@ class SequenceReplayBuffer:
         min_next_ep_idx = self._min_valid_ep_idx + len(self.episodes)
         if self._next_ep_idx < min_next_ep_idx:
             self._next_ep_idx = min_next_ep_idx
+
+        self._active_episodes = [None] * self.n_envs
+        if continuation_observations is None:
+            self._active_episodes[:min(len(active), self.n_envs)] = active[:self.n_envs]
+        else:
+            for index, episode in enumerate(active):
+                if episode is None:
+                    continue
+                continuation = continuation_observations[index] if index < len(continuation_observations) else None
+                if continuation is None:
+                    self.total_transitions -= episode.length
+                else:
+                    episode.set_final_obs(continuation)
+                    self._store_episode(episode)
 
     def _rebuild_valid_starts(self) -> None:
         """Rebuild valid start indices from restored episodes."""

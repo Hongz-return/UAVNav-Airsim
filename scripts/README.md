@@ -5,22 +5,36 @@
 
 | 分类 | 入口 | 用途 |
 |---|---|---|
-| 训练 | `scripts.training.train_single` | 单模型、单 AirSim 实例训练 |
+| 训练 | `scripts.training.train_trainenv` | 启动本地 UE5.4 TrainEnv 并训练一个 MA-SAC |
+| 训练 | `scripts.training.train_single` | 连接已启动的 AirSim 实例训练单模型，默认单端口 |
 | 训练 | `scripts.training.train_parallel` | 多端口训练调度与冻结计划 |
-| 训练 | `scripts/training/train_env4_local.ps1` | ENV4 本机方法子集的一键训练 |
-| 训练 | `scripts/training/train_env4_remote.ps1` | ENV4 远端方法子集的一键训练 |
 | 评估 | `scripts.evaluation.evaluate_single` | 单个冻结模型评估 |
 | 评估 | `scripts.evaluation.evaluate_completed_runs` | 批量评估完整训练运行 |
 | 评估 | `scripts.evaluation.rebuild_summary` | 从现有逐模型结果重建汇总 |
-| 评估 | `scripts.evaluation.evaluate_history_ablation` | 历史截断消融评估 |
-| 评估 | `scripts.evaluation.evaluate_history_lengths` | 历史长度扫描 |
 | 评估 | `scripts.evaluation.record_parallel` | 分波次录制评估 |
-| 筛选 | `scripts.selection.select_checkpoints` | 通用检查点筛选与冻结盲测计划 |
-| 筛选 | `scripts.selection.select_and_evaluate_env4` | ENV4 筛选与评估入口 |
-| 筛选 | `scripts.selection.select_env4_coordatt` | ENV4 CoordAtt 定向重筛 |
-| 筛选 | `scripts.selection.recheck_targeted_checkpoints` | 指定场景/算法的检查点复核 |
 | 分析 | `scripts.analysis.analyze_training_metrics` | TensorBoard 训练指标分析 |
-| 打包 | `scripts/packaging/` | 检查点、候选与论文数据打包 |
+
+## UE5.4 TrainEnv
+
+```powershell
+pixi run python -u -m scripts.training.train_trainenv --instances 4 --clock-speed 2.0 --seed 0
+```
+
+默认读取 `configs/ch4_train_trainenv.ini`，共采集 300000 条环境转移，四实例每批采集 4 条。预算必须能整除实例数。
+入口从 `D:\UEBuilds\TrainEnv\Windows\TrainEnvAirSim.exe` 定位打包运行程序，以
+`--first-port`（默认 41771）起分配独立端口。RPC 确认四个实例都加载本次配置后才训练，退出时回收这批 UE 进程。
+
+每个实例使用独立的临时 settings，开启 `NoDisplay` 和 60 FPS 上限，只请求 320×180 的
+`DepthPlanar`。相机的深度捕获参数和 90×60 策略输入由原配置提供。可用
+`--clock-speed 1.0` 按原速运行。 `--instances 1` 使用同步采样。
+
+异步更新只采样已入库的回放数据。第一次达到回放就绪条件的批次会在入库后更新。
+`--no-overlap-updates` 在每批入库后再执行更新，
+`--no-fast-history` 使用按有效历史长度分组的原时序计算。
+
+运行目录下的 `launch.json` 保存端口、进程号和实际 UE 参数，`config/config.ini` 留存
+训练配置。进度行给出累计环境转移和梯度更新数，TensorBoard 事件和模型分别在
+`tb_logs/` 与 `models/`。可用 `--run-dir` 指定新目录。
 
 ## 常用命令
 
@@ -29,20 +43,6 @@
 ```powershell
 pixi run python -m scripts.training.train_parallel --scene tunnel --dry-run
 pixi run python -m scripts.evaluation.evaluate_completed_runs -n 100 --max-parallel 3 --dry-run
-pixi run python -m scripts.selection.select_and_evaluate_env4
-```
-
-ENV4 本机训练需显式授权：
-
-```powershell
-.\scripts\training\train_env4_local.ps1          # 只检查计划
-.\scripts\training\train_env4_local.ps1 -Execute # 正式启动训练
-```
-
-恢复冻结的 ENV4 筛选计划需显式授权：
-
-```powershell
-pixi run python -m scripts.selection.select_and_evaluate_env4 --execute --resume <run_id>
 ```
 
 汇总某个场景的训练指标（只读 TensorBoard 事件文件）：
@@ -59,9 +59,8 @@ pixi run python -m scripts.evaluation.rebuild_summary `
 ```
 
 所有新训练输出写入 `Logs/TrainData`，所有新评估、筛选和诊断输出写入
-`Logs/EvaData`。目录规则见 [`../Logs/README.md`](../Logs/README.md)，实验协议
-见 [`../RETRAINING.md`](../RETRAINING.md)，各入口之间的调用关系见
-[`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md)。
+`Logs/EvaData`。目录规则见 [产物说明](../Logs/README.md)，原隧道批次沿用
+[复现协议](../RETRAINING.md)。历史 ENV4 筛选、评测与打包入口见 [归档](../archive/README.md)。
 
 `scripts/**/*.ps1`、`scripts.evaluation.record_parallel` 的窗口摆放，以及默认的
 `D:\UEBuilds\...` 与 `C:\Users\...` 路径都是 Windows 专用；`--dry-run` 计划生成
