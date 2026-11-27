@@ -183,8 +183,8 @@ export function App({ store, connection }: { store: LiveStore; connection: Conne
           <span className="metric" title="后端采集帧率"><b>{meta?.fps.toFixed(1) ?? '—'}</b> FPS</span>
           <span className="metric" title="当前帧最慢一次 AirSim RPC"><b>{meta?.rpc_ms.toFixed(0) ?? '—'}</b> ms RPC</span>
           <span className={`pill collision-pill ${collision ? 'is-collision' : ''}`}
-            title={collision ? meta?.collision.object || '检测到碰撞' : '碰撞状态'} role="status">
-            <i aria-hidden="true" />{collision ? '碰撞告警' : '碰撞监测'}
+            title={collision ? meta?.collision.object || '检测到碰撞' : '从 AirSim 状态读取碰撞信息'} role="status">
+            <i aria-hidden="true" />{collision ? '碰撞告警' : meta?.collision.available ? '碰撞监测' : '碰撞未采集'}
           </span>
         </div>
         <div className="toolbar-actions">

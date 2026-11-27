@@ -32,7 +32,7 @@ export interface FrameMeta {
   vel_body: [number, number, number];
   speed: number | null;
   camera: { pos: [number, number, number]; quat: [number, number, number, number] };
-  collision: { has_collided: boolean; new: boolean; object: string; ts: number };
+  collision: { available: boolean; has_collided: boolean; new: boolean; object: string; ts: number };
   shader_warming: boolean;
   no_return: boolean;
   n_points: number;

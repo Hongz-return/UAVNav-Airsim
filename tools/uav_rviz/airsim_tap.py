@@ -3,7 +3,7 @@
 关键保证
 --------
 1. **100% 只读**：所有 RPC 都经过 :class:`ReadOnlyClient` 白名单代理，仅允许
-   ``ping / getMultirotorState / simGetVehiclePose / simGetCollisionInfo / simGetImages /
+   ``ping / getMultirotorState / simGetVehiclePose / simGetImages /
    simListSceneObjects / simGetObjectPose / simGetObjectScale``。``enableApiControl / armDisarm /
    simPause / reset / moveByVelocity*`` 等任何写接口都会在客户端侧直接抛 :class:`ReadOnlyViolation`，
    根本不会发往仿真器。
@@ -64,7 +64,6 @@ READ_ONLY_METHODS = frozenset(
         "ping",
         "getMultirotorState",
         "simGetVehiclePose",
-        "simGetCollisionInfo",
         "simGetImages",
         "simListSceneObjects",
         "simGetObjectPose",
@@ -622,7 +621,8 @@ class AirSimTap:
 
         pose = timed("pose", client.simGetVehiclePose)
         state = timed("state", client.getMultirotorState)
-        collision = timed("collision", client.simGetCollisionInfo)
+        # CosysAirSim's simGetCollisionInfo consumes the flag used by the training task.
+        collision = getattr(state, "collision", None)
         want_rgb = prof.name == "direct" and self.rgb_enabled
         requests = [api.ImageRequest(self.camera, api.ImageType.DepthPlanar, True, False)]
         if want_rgb:
@@ -701,8 +701,10 @@ class AirSimTap:
 
         # --- 碰撞 / 目标误差 ---
         col_ts = int(getattr(collision, "time_stamp", 0) or 0)
-        new_collision = bool(collision.has_collided) and col_ts != self._last_collision_ts
-        self._last_collision_ts = col_ts if collision.has_collided else self._last_collision_ts
+        has_collided = bool(getattr(collision, "has_collided", False))
+        new_collision = has_collided and col_ts != self._last_collision_ts
+        if has_collided:
+            self._last_collision_ts = col_ts
         goal = self.geometry.effective_goal()
         goal_err = None
         if goal is not None:
@@ -740,7 +742,8 @@ class AirSimTap:
             "speed": _num(speed),
             "camera": {"pos": _vec(cam_pos_enu), "quat": _vec(cam_q_enu, 6)},
             "collision": {
-                "has_collided": bool(collision.has_collided),
+                "available": has_collided or col_ts > 0,
+                "has_collided": has_collided,
                 "new": new_collision,
                 "object": str(getattr(collision, "object_name", "") or ""),
                 "ts": col_ts,

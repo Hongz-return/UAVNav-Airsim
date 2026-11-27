@@ -44,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="训练运行目录（读取 course_episodes.jsonl 尾部的目标点/回合障碍）；auto=自动取 Logs/TrainData/Runs 下最新")
     p.add_argument("--goal-position", type=float, nargs=3, metavar=("X", "Y", "Z"),
                    help="手动提供 AirSim 车辆局部 NED 目标，单位米")
+    p.add_argument("--no-infer-goal", action="store_true", help="只显示已知目标，不从旧隧道几何推断终点")
     p.add_argument("--open", action="store_true", help="启动后用默认浏览器打开")
     p.add_argument("--app", action="store_true", help="尝试用 Edge --app 窗口模式打开，缺失则退回默认浏览器")
     p.add_argument("--demo", "--simulate", dest="simulate", action="store_true",
@@ -86,7 +87,10 @@ def open_ui(url: str, app: bool) -> Optional[str]:
 
 async def serve(args: argparse.Namespace) -> None:
     run_dir = resolve_run_dir(args.run_dir)
-    geometry = GeometryLoader(None, spawn_ned_z=args.spawn_ned_z, floor_z=args.floor_z, run_dir=run_dir)
+    geometry = GeometryLoader(
+        None, spawn_ned_z=args.spawn_ned_z, floor_z=args.floor_z,
+        run_dir=run_dir, infer_goals=not args.no_infer_goal,
+    )
     if args.goal_position:
         geometry.set_manual_goal(ned_to_enu_point(args.goal_position))
     elif args.simulate and not run_dir:

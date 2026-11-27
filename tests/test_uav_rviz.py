@@ -394,7 +394,7 @@ class ReadOnlyGuardTests(unittest.TestCase):
     FORBIDDEN = ("enableApiControl", "armDisarm", "simPause", "reset", "moveByVelocityAsync",
                  "moveByVelocityZAsync", "moveByVelocityBodyFrameAsync", "takeoffAsync", "landAsync",
                  "simSetVehiclePose", "simSpawnObject", "simDestroyObject", "simContinueForTime", "hoverAsync",
-                 "simSetObjectPose", "simSetCameraPose", "simRunConsoleCommand")
+                 "simSetObjectPose", "simSetCameraPose", "simRunConsoleCommand", "simGetCollisionInfo")
 
     def test_every_write_api_blocked_before_reaching_simulator(self):
         sim = SimulatedAirSim()

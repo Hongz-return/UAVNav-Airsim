@@ -206,12 +206,14 @@ class GeometryLoader:
         floor_z: float = DEFAULT_FLOOR_Z,
         name_regex: str = DEFAULT_NAME_REGEX,
         run_dir: Optional[Path] = None,
+        infer_goals: bool = True,
     ) -> None:
         self.client = client
         self.spawn_ned_z = spawn_ned_z
         self.floor_z = floor_z
         self.name_regex = name_regex
         self.run_dir = Path(run_dir) if run_dir else None
+        self.infer_goals = infer_goals
         self._live: dict[str, SceneBox] = {}
         self._ignored: set[str] = set()
         self._episode_stat: Optional[tuple[int, int]] = None
@@ -328,7 +330,7 @@ class GeometryLoader:
         vel_enu: tuple[float, float, float] = (0.0, 0.0, 0.0),
     ) -> bool:
         """根据当前端口实时走廊几何或飞行航向推断当前回合终点，避免被多进程日志文件串扰。"""
-        inferred = infer_live_goal(pos_enu, vel_enu, self._live, self.floor_z)
+        inferred = infer_live_goal(pos_enu, vel_enu, self._live, self.floor_z) if self.infer_goals else None
         if inferred == self.live_goal:
             return False
         self.live_goal = inferred
