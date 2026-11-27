@@ -5,8 +5,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
-from scripts.training.train_navrl_curriculum import ForestPromotion
+from scripts.training.train_navrl_curriculum import ForestPromotion, load_protocol
 
 
 class _Model:
@@ -25,6 +26,27 @@ def _gate(stage, rounds):
         row["collision_free_successes"] >= 41 for row in rounds[-2:]
     )
     return {"stage": stage, "decision": "advance" if passed else "stay"}
+
+
+class ForestProtocolTests(unittest.TestCase):
+    def test_default_loads_full_field_and_explicit_versions_resolve_older_maps(self):
+        with TemporaryDirectory() as tmp:
+            project = Path(tmp) / "Forest.uproject"
+            content = project.parent / "Content" / "Training" / "Maps"
+            content.mkdir(parents=True)
+            stages = [SimpleNamespace(map_path=f"/Game/Training/Maps/v{version}") for version in (1, 2, 3)]
+            for version in (1, 2, 3):
+                (content / f"v{version}.umap").touch()
+            rules = {
+                "STAGES": (stages[0],), "V2_STAGES": (stages[1],), "V3_STAGES": (stages[2],),
+                "evaluation_scenarios": lambda stage, round_id, scene_version=1: (stage, round_id, scene_version),
+            }
+            with patch("scripts.training.train_navrl_curriculum.runpy.run_path", side_effect=lambda _: rules.copy()):
+                for version, selected in enumerate(
+                    (load_protocol(project, 1), load_protocol(project, 2), load_protocol(project)), 1,
+                ):
+                    self.assertEqual(selected["STAGES"], (stages[version - 1],))
+                    self.assertEqual(selected["evaluation_scenarios"](1, 7), (1, 7, version))
 
 
 class ForestPromotionTests(unittest.TestCase):

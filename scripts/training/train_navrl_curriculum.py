@@ -34,14 +34,15 @@ def write_json(path, data):
     temporary.replace(path)
 
 
-def load_protocol(project, scene_version=2):
+def load_protocol(project, scene_version=3):
     source = project.parent / "Tools" / "NavRL" / "navrl_curriculum.py"
     rules = runpy.run_path(str(source))
-    if scene_version == 2:
-        if "V2_STAGES" not in rules:
-            raise ValueError(f"The Unreal project does not define the V2 forest maps in {source}.")
-        rules["STAGES"] = rules["V2_STAGES"]
-        rules["evaluation_scenarios"] = partial(rules["evaluation_scenarios"], scene_version=2)
+    if scene_version != 1:
+        stage_key = f"V{scene_version}_STAGES"
+        if stage_key not in rules:
+            raise ValueError(f"The Unreal project does not define the V{scene_version} forest maps in {source}.")
+        rules["STAGES"] = rules[stage_key]
+        rules["evaluation_scenarios"] = partial(rules["evaluation_scenarios"], scene_version=scene_version)
     for stage in rules["STAGES"]:
         relative = stage.map_path.removeprefix("/Game/")
         if relative == stage.map_path:
@@ -109,7 +110,7 @@ class ForestPromotion(BaseCallback):
         }
         if "crossing_axis" in cases["scenarios"][0]:
             if any(type(row.get("crossed_core")) is not bool for row in outcomes):
-                raise RuntimeError("V2 evaluation outcomes must include actual core crossings.")
+                raise RuntimeError("Forest evaluation outcomes must include actual core crossings.")
             crossings = sum(row["crossed_core"] for row in outcomes)
             record.update(
                 core_crossing_episodes=crossings,
@@ -139,7 +140,7 @@ def run_course(args):
         base.read_file(handle)
     rules = load_protocol(args.ue_project, args.scene_version)
     stages = rules["STAGES"]
-    route_portals = rules["V2_ROUTE_PORTALS"] if args.scene_version == 2 else None
+    route_portals = rules["V2_ROUTE_PORTALS"] if args.scene_version >= 2 else None
     training_ports = list(range(args.first_port, args.first_port + args.instances))
     evaluation_port = training_ports[-1] + 1
     template = load_settings(args.ue_project.parent / "Config" / "AirSim.settings.json")
@@ -210,8 +211,8 @@ def parse_args(argv=None):
     parser.add_argument("-c", "--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--ue-project", type=Path, default=DEFAULT_PROJECT)
     parser.add_argument("--ue-exe", type=Path, default=DEFAULT_EDITOR)
-    parser.add_argument("--scene-version", type=int, choices=(1, 2), default=2,
-                        help="Forest map version (default: 2 with opposite-side routes)")
+    parser.add_argument("--scene-version", type=int, choices=(1, 2, 3), default=3,
+                        help="Forest map version (default: 3 with obstacles throughout the arena)")
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--resume", type=Path, help="Optional initial MA-SAC checkpoint for stage 1")
     parser.add_argument("--instances", type=int, default=1, help="Training instances, plus one separate evaluator")
