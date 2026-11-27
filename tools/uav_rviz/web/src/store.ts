@@ -70,7 +70,16 @@ export interface SceneMsg {
   roof_z: number | null;
   boxes: SceneBox[];
   box_source: string;
-  goal: { p: [number, number, number]; radii: [number, number]; alt_tol: number; source: string; family: string | null } | null;
+  navrl?: boolean;
+  goal: {
+    p: [number, number, number];
+    radii: [number, number];
+    alt_tol: number;
+    source: string;
+    family: string | null;
+    stage?: number;
+    episode?: number;
+  } | null;
   scan_error: string | null;
 }
 
@@ -186,6 +195,9 @@ export class LiveStore {
 
   setConn(ws: ConnState['ws'], attempts?: number): void {
     this.conn = { ws, attempts: attempts ?? this.conn.attempts };
+    if (ws === 'closed' && this.scene?.goal?.source === 'navrl_live') {
+      this.setScene({ ...this.scene, goal: null });
+    }
     this.emit('conn');
   }
 

@@ -148,7 +148,9 @@ def run_course(args):
         stage_dir = root / f"stage_{stage.number}"
         stage_dir.mkdir()
         cfg = forest_config(base, stage)
+        cfg.set("navrl_forest", "goal_dir", str(stage_dir).replace("%", "%%"))
         evaluation_cfg = forest_config(base, stage)
+        evaluation_cfg.remove_option("navrl_forest", "goal_dir")
         evaluation_cfg.set("airsim", "rpc_port", str(evaluation_port))
 
         def evaluate(checkpoint, directory, cases):

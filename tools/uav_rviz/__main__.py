@@ -23,6 +23,8 @@ import webbrowser
 from pathlib import Path
 from typing import Optional
 
+from tools.experiment_paths import TRAIN_RUNS_ROOT
+
 from .airsim_tap import PROFILES, AirSimTap, ReadOnlyClient
 from .coords import ned_to_enu_point
 from .geometry_loader import DEFAULT_FLOOR_Z, DEFAULT_SPAWN_NED_Z, GeometryLoader, resolve_run_dir
@@ -40,8 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="127.0.0.1", help="监听地址（默认仅本机回环）")
     p.add_argument("--mode", choices=sorted(PROFILES), default="bypass",
                    help="bypass=训练旁路(低开销,默认) / direct=演示直连(20Hz)")
-    p.add_argument("--run-dir", default=None,
-                   help="训练运行目录（读取 course_episodes.jsonl 尾部的目标点/回合障碍）；auto=自动取 Logs/TrainData/Runs 下最新")
+    run_source = p.add_mutually_exclusive_group()
+    run_source.add_argument("--run-dir", default=None,
+                            help="训练运行目录。NavRL 可指定课程或关卡目录。auto=自动选最近的旧隧道回合日志")
+    run_source.add_argument("--follow-navrl", action="store_true",
+                            help="跟随标准运行目录中使用当前端口的最新 NavRL 课程及关卡")
     p.add_argument("--goal-position", type=float, nargs=3, metavar=("X", "Y", "Z"),
                    help="手动提供 AirSim 车辆局部 NED 目标，单位米")
     p.add_argument("--no-infer-goal", action="store_true", help="只显示已知目标，不从旧隧道几何推断终点")
@@ -90,10 +95,11 @@ async def serve(args: argparse.Namespace) -> None:
     geometry = GeometryLoader(
         None, spawn_ned_z=args.spawn_ned_z, floor_z=args.floor_z,
         run_dir=run_dir, infer_goals=not args.no_infer_goal,
+        navrl_runs_root=TRAIN_RUNS_ROOT / "navrl_curriculum" if args.follow_navrl else None,
     )
     if args.goal_position:
         geometry.set_manual_goal(ned_to_enu_point(args.goal_position))
-    elif args.simulate and not run_dir:
+    elif args.simulate and not run_dir and not args.follow_navrl:
         geometry.set_manual_goal((85.0, 0.0, args.floor_z + 2.0))
     client_factory = None
     api = None
@@ -106,7 +112,8 @@ async def serve(args: argparse.Namespace) -> None:
         api = SIM_API
 
     server = RvizServer(host=args.host, port=args.web_port, static_dir=Path(args.static_dir))
-    status_details = {"run_dir": str(run_dir) if run_dir else None, "simulate": args.simulate}
+    status_details = {"run_dir": str(run_dir) if run_dir else None,
+                      "follow_navrl": args.follow_navrl, "simulate": args.simulate}
     tap = AirSimTap(
         host=args.airsim_host, port=args.port, mode=args.mode, client_factory=client_factory, api=api,
         camera=args.camera, fov_deg=args.fov, geometry=geometry, floor_z=args.floor_z,

@@ -16,7 +16,7 @@ const LAYER_SWITCHES = [
   { key: 'trail', label: '历史轨迹', color: 'trail' },
   { key: 'obstacles', label: '障碍盒', color: 'obstacle' },
   { key: 'roofSeeThrough', label: '顶棚透视', color: 'roof' },
-  { key: 'goal', label: '目标圆柱圈', color: 'goal' },
+  { key: 'goal', label: '目标圈与指向线', color: 'goal' },
 ] as const satisfies ReadonlyArray<{ key: keyof Layers; label: string; color: string }>;
 
 function PortSelector({ port, store }: { port: number; store: LiveStore }) {
@@ -121,6 +121,10 @@ function LayerPanel({ store }: { store: LiveStore }) {
           onClick={() => store.send({ cmd: 'refresh_scene' })}>刷新场景障碍</button>
         <span>{scene?.scan_error ? '场景读取失败' : `${scene?.boxes.length ?? 0} 个障碍对象`}</span>
         {scene?.goal?.source === 'course_episodes' && <span>目标来自上一完成回合</span>}
+        {scene?.goal?.source === 'navrl_live' && (
+          <span>第 {scene.goal.stage} 档 · 第 {scene.goal.episode} 回合</span>
+        )}
+        {scene?.navrl && !scene.goal && status?.connected && <span>等待训练发布随机终点</span>}
       </div>
     </aside>
   );
