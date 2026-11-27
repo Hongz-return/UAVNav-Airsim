@@ -29,6 +29,7 @@ class AirsimGymEnv(gym.Env):
         self.perception = None
         self.training_routes = []
         self.stage3_course = None
+        self.navrl_forest = False
         self.print_airsim_log = False
         # Evaluation-only switch: keep episodes alive after collision events
         # and let the evaluator aggregate collision statistics separately.
@@ -43,6 +44,7 @@ class AirsimGymEnv(gym.Env):
         self.env_name = cfg.get("options", "env_name")
         self.dynamic_name = cfg.get("options", "dynamic_name")
         self.perception_type = cfg.get("options", "perception")
+        self.navrl_forest = cfg.has_section("navrl_forest")
         self.print_airsim_log = cfg.getboolean("options", "print_airsim_log", fallback=False)
         reward_type = cfg.get("options", "reward_type", fallback="reward_final")
         use_pid_residual = cfg.getboolean("options", "use_pid_residual", fallback=False)
@@ -143,6 +145,12 @@ class AirsimGymEnv(gym.Env):
         route_reversed = False
         if self.stage3_course is not None and self._evaluation_scenarios is None:
             self.stage3_course.select_route(self)
+        elif self.navrl_forest and self._evaluation_scenarios is None:
+            from tools.navrl_forest_runtime import sample_training_route
+
+            start, goal, yaw = sample_training_route(self.np_random)
+            self.dynamic_model.set_start(start, random_angle=0.0, fixed_yaw=yaw)
+            self.dynamic_model._set_goal_pose_single(goal)
         elif self._evaluation_scenarios is None and self.training_routes:
             route_idx = int(self.np_random.integers(len(self.training_routes)))
             start, goal = self.training_routes[route_idx]
@@ -163,7 +171,7 @@ class AirsimGymEnv(gym.Env):
         if self.task:
             self.task.reset()
 
-        disable_augmentation = self._evaluation_scenarios is not None or (
+        disable_augmentation = self.navrl_forest or self._evaluation_scenarios is not None or (
             self.stage3_course is not None and self.stage3_course.disable_virtual_ceiling
         )
         self.perception.reset(rng=self.np_random, disable_augmentation=disable_augmentation)

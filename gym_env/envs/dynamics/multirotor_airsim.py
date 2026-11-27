@@ -70,12 +70,16 @@ class MultirotorDynamicsAirsim:
             raise ValueError("environment.max_vertical_difference must be finite and positive")
         self.align_start_yaw_to_goal = cfg.getboolean('environment', 'align_start_yaw_to_goal', fallback=False)
         self.dt = cfg.getfloat('multirotor', 'dt')
-        self.vehicle_name = vehicle_name or cfg.get('airsim', 'vehicle_name', fallback='')
+        self._forest_reset = cfg.has_section('navrl_forest')
+        default_vehicle = 'SimpleFlight' if self._forest_reset else ''
+        self.vehicle_name = vehicle_name or cfg.get('airsim', 'vehicle_name', fallback=default_vehicle)
         self.airsim_ip = cfg.get('airsim', 'ip', fallback='')
         self.airsim_port = cfg.getint('airsim', 'rpc_port', fallback=41451)
         self.airsim_timeout = cfg.getfloat('airsim', 'timeout_value', fallback=3600.0)
         self.synchronous_steps = cfg.getboolean('airsim', 'synchronous_steps', fallback=False)
         self.cache_step_state = cfg.getboolean('airsim', 'cache_step_state', fallback=False)
+        if self._forest_reset and (not self.synchronous_steps or not self.vehicle_name):
+            raise ValueError('NavRL forest requires synchronous AirSim steps and a named UE vehicle')
 
         # AirSim client (shared if provided, else create new)
         if client is not None:
@@ -170,6 +174,13 @@ class MultirotorDynamicsAirsim:
             state.orientation = to_quaternion(0, 0, yaw)
             state.linear_velocity = state.angular_velocity = airsim.Vector3r()
             state.linear_acceleration = state.angular_acceleration = airsim.Vector3r()
+            if getattr(self, '_forest_reset', False):
+                # Teleport the rendered pawn before assigning the AirSim physics pose.
+                self.client.simPause(True)
+                self.client.simGetCollisionInfo(self.vehicle_name)
+                pose = airsim.Pose(state.position, state.orientation)
+                if not self.client.simSetObjectPose(self.vehicle_name, pose):
+                    raise RuntimeError(f'Could not move the UE pawn for AirSim vehicle {self.vehicle_name!r}')
             self.client.simSetKinematics(state, True, self.vehicle_name)
             self._advance_synchronously(0, 0, 0, airsim.YawMode(True, 0), duration=1.0)
             self._validate_reset_state(yaw)
