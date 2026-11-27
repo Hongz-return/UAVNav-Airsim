@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from scripts.training.train_navrl_curriculum import ForestPromotion, load_protocol
+from scripts.training.train_navrl_curriculum import ForestPromotion, launch_stage, load_protocol
 
 
 class _Model:
@@ -29,6 +29,15 @@ def _gate(stage, rounds):
 
 
 class ForestProtocolTests(unittest.TestCase):
+    def test_stage_uses_requested_clock_speed(self):
+        args = SimpleNamespace(ue_exe=Path("editor.exe"), ue_project=Path("Forest.uproject"),
+                               startup_timeout=120, clock_speed=2.0)
+        stage = SimpleNamespace(map_path="/Game/Training/Maps/v3")
+        with patch("scripts.training.train_navrl_curriculum.launch_trainenv") as launch:
+            launch_stage(args, stage, [41811], Path("run"), Path("settings.json"))
+        self.assertEqual(launch.call_args.kwargs["clock_speed"], 2.0)
+        self.assertEqual(launch.call_args.kwargs["clock_type"], "SteppableClock")
+
     def test_default_loads_full_field_and_explicit_versions_resolve_older_maps(self):
         with TemporaryDirectory() as tmp:
             project = Path(tmp) / "Forest.uproject"

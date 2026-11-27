@@ -98,6 +98,11 @@ class MultirotorDynamicsAirsim:
             settings = json.loads(self.client.getSettingsString())
             if settings.get('ClockType') != 'SteppableClock':
                 raise ValueError('synchronous_steps requires AirSim ClockType=SteppableClock')
+            if self._forest_reset:
+                clock_speed = settings.get('ClockSpeed', 1.0)
+                if type(clock_speed) not in (int, float) or clock_speed not in (1, 2):
+                    raise ValueError('NavRL forest requires AirSim ClockSpeed=1 or 2')
+                self._navrl_clock_speed = clock_speed
 
         self.client.enableApiControl(True, self.vehicle_name)
         self.client.armDisarm(True, self.vehicle_name)
@@ -261,6 +266,7 @@ class MultirotorDynamicsAirsim:
         )
         advanced = 0.0
         minimum_window = 0.002
+        clock_speed = getattr(self, '_navrl_clock_speed', 1.0)
         scene_step = getattr(self, 'scene_step_callback', None)
         last_progress = time.monotonic()
         try:
@@ -271,7 +277,8 @@ class MultirotorDynamicsAirsim:
                 window = control_duration - advanced
                 if scene_step is not None:
                     window = min(window, 0.05)
-                self.client.simContinueForTime(max(minimum_window, window))
+                # AirSim uses a wall-clock window here. Keep the NavRL action budget in simulation time.
+                self.client.simContinueForTime(max(minimum_window, window) / clock_speed)
                 timestamp = self.client.getMultirotorState(vehicle_name=self.vehicle_name).timestamp
                 advanced = (timestamp - before) / 1e9
                 if scene_step is not None:

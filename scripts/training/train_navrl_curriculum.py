@@ -56,7 +56,7 @@ def load_protocol(project, scene_version=3):
 def launch_stage(args, stage, ports, directory, settings):
     return launch_trainenv(
         executable=args.ue_exe, editor_project=args.ue_project, template=settings,
-        ports=ports, start_position=[0.0, 0.0, 0.0], clock_speed=1.0,
+        ports=ports, start_position=[0.0, 0.0, 0.0], clock_speed=args.clock_speed,
         clock_type="SteppableClock", run_dir=directory, timeout=args.startup_timeout,
         map_path=stage.map_path, unreal_args=UNREAL_ARGS,
     )
@@ -159,6 +159,7 @@ def run_course(args):
     write_json(root / "curriculum.json", {
         "stages": [stage._asdict() for stage in stages],
         "scene_version": args.scene_version,
+        "clock_speed": args.clock_speed,
         "episodes_per_round": rules["EPISODES_PER_ROUND"],
         "success_rate_strictly_above": rules["SUCCESS_RATE_THRESHOLD"],
         "consecutive_passes": rules["CONSECUTIVE_PASSES"],
@@ -213,6 +214,8 @@ def parse_args(argv=None):
     parser.add_argument("--ue-exe", type=Path, default=DEFAULT_EDITOR)
     parser.add_argument("--scene-version", type=int, choices=(1, 2, 3), default=3,
                         help="Forest map version (default: 3 with obstacles throughout the arena)")
+    parser.add_argument("--clock-speed", type=float, choices=(1.0, 2.0), default=1.0,
+                        help="AirSim SteppableClock multiplier for training and evaluation (default: 1)")
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--resume", type=Path, help="Optional initial MA-SAC checkpoint for stage 1")
     parser.add_argument("--instances", type=int, default=1, help="Training instances, plus one separate evaluator")
