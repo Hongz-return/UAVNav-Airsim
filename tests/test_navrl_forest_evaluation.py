@@ -2,12 +2,57 @@
 
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+from configparser import ConfigParser
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from threading import Barrier
+import json
 
-from tools.navrl_forest_evaluation import _evaluate_scenario, _path_metrics
+from tools.navrl_forest_evaluation import _evaluate_scenario, _path_metrics, evaluate_checkpoint
 
 
 class CoreTraversalTests(unittest.TestCase):
+    def test_four_workers_own_their_histories_and_report_every_case_once(self):
+        ports = [41815, 41816, 41817, 41818]
+        cfg = ConfigParser()
+        cfg.read_dict({"airsim": {"rpc_port": ports[0]}, "navrl_forest": {}, "options": {"algo": "SAC"}})
+        cases = [{"scenario_id": str(i)} for i in range(50)]
+        barrier = Barrier(4, timeout=10)
+        first = set()
+        persisted = []
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = root / "checkpoint.zip"
+            checkpoint.touch()
+            (root / "scenario_manifest.json").touch()
+
+            def simulate(model, env, transpose, case, *, seed, on_reset):
+                port = model.port
+                self.assertEqual(env.port, port)
+                on_reset(case["scenario_id"])
+                if port not in first:
+                    first.add(port)
+                    barrier.wait()
+                marker = json.loads((root / f"active_scenario_{port}.json").read_text())
+                self.assertEqual(marker["scenario_id"], case["scenario_id"])
+                return dict(case, collision_free_success=True)
+
+            def make_env(config):
+                env = Mock()
+                gym = Mock(port=config.getint("airsim", "rpc_port"))
+                env.venv.envs = [gym]
+                return env
+
+            mod = "tools.navrl_forest_evaluation."
+            with patch(mod + "build_runtime_env", side_effect=make_env), patch(mod + "use_mamba_backend", return_value=True), \
+                 patch(mod + "load_model", side_effect=lambda *a, cfg, **k: Mock(port=cfg.getint("airsim","rpc_port"))), \
+                 patch(mod + "_evaluate_scenario", side_effect=simulate):
+                rows = evaluate_checkpoint(checkpoint, cfg, cases, seed=0, ports=ports, on_outcome=persisted.append)
+            self.assertEqual([r["scenario_id"] for r in rows], [c["scenario_id"] for c in cases])
+            self.assertCountEqual(persisted, rows)
+            self.assertEqual(set(ports), {row["evaluation_port"] for row in rows})
+
     def test_segment_is_clipped_to_the_core_even_with_both_endpoints_outside(self):
         outcome = _path_metrics([(2, 0), (46, 0)], 0, [46, 0, 0])
         self.assertEqual(outcome["horizontal_path_m"], 44)
@@ -44,7 +89,13 @@ class CoreTraversalTests(unittest.TestCase):
 
         legacy = _evaluate_scenario(model, env, identity, scenario)
         self.assertNotIn("crossed_core", legacy)
-        v2 = _evaluate_scenario(model, env, identity, {**scenario, "crossing_axis": 0})
+        publish = Mock()
+        v2 = _evaluate_scenario(model, env, identity, {**scenario, "crossing_axis": 0}, on_reset=publish)
+        publish.assert_called_once_with("case")
         self.assertEqual(v2["horizontal_path_m"], 44)
         self.assertTrue(v2["crossed_core"])
         self.assertEqual(v2["collision_free_success"], legacy["collision_free_success"])
+        publish.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, "expected"):
+            _evaluate_scenario(model, env, identity, {**scenario, "scenario_id": "wrong"}, on_reset=publish)
+        publish.assert_not_called()

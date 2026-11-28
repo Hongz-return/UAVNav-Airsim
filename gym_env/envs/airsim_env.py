@@ -161,6 +161,10 @@ class AirsimGymEnv(gym.Env):
             parsed.append((start, goal))
         return parsed
 
+    def enable_random_forest_routes(self):
+        """Switch the next episode reset to the existing forest portal sampler."""
+        self.training_routes = []
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
@@ -173,7 +177,15 @@ class AirsimGymEnv(gym.Env):
         elif self.navrl_forest and self._evaluation_scenarios is None:
             from tools.navrl_forest_runtime import sample_training_route
 
-            start, goal, yaw = sample_training_route(self.np_random, self._navrl_route_portals)
+            if self.training_routes:
+                route_idx = int(self.np_random.integers(len(self.training_routes)))
+                start, goal = self.training_routes[route_idx]
+                route_reversed = bool(self.random_route_reverse and self.np_random.integers(2))
+                if route_reversed:
+                    start, goal = goal, start
+                yaw = np.arctan2(goal[1] - start[1], goal[0] - start[0])
+            else:
+                start, goal, yaw = sample_training_route(self.np_random, self._navrl_route_portals)
             self.dynamic_model.set_start(start, random_angle=0.0, fixed_yaw=yaw)
             self.dynamic_model._set_goal_pose_single(goal)
             live_goal_ned = goal

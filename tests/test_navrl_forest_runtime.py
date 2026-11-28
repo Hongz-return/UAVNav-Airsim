@@ -52,6 +52,11 @@ class NavRLForestRouteTests(unittest.TestCase):
         legacy = forest_config(version2, stage)
         self.assertNotIn("route_portals", legacy["navrl_forest"])
         self.assertEqual(legacy["environment"]["start_position"], "[0.0, 0.0, 0.0]")
+        self.assertEqual(version2.getfloat("environment", "distance_norm_scale"), 60.0)
+        self.assertEqual(version2.getint("environment", "max_episode_steps"), 500)
+        self.assertEqual(version2.getfloat("reward", "progress_scale"), 0.6)
+        self.assertEqual(version2.getfloat("reward", "reward_timeout"), -25.0)
+        self.assertEqual(version2.getfloat("DRL", "min_ent_coef"), 0.02)
 
 
 if __name__ == "__main__":

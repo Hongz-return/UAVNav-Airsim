@@ -29,6 +29,7 @@ from .airsim_tap import PROFILES, AirSimTap, ReadOnlyClient
 from .coords import ned_to_enu_point
 from .geometry_loader import DEFAULT_FLOOR_Z, DEFAULT_SPAWN_NED_Z, GeometryLoader, resolve_run_dir
 from .ws_server import CommandRouter, RvizServer
+from .training_ports import discover_training_ports
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_STATIC_DIR = PACKAGE_DIR / "web" / "dist"
@@ -125,7 +126,41 @@ async def serve(args: argparse.Namespace) -> None:
         on_event=server.publish_json,
     )
     router = CommandRouter(tap, lambda: server.port, broadcast=server.publish_json)
-    server.command_handler = router
+    discover = args.follow_navrl and not args.simulate
+    if discover:
+        status_details.update(auto_port=True, training_ports=[], evaluation_ports=[])
+
+    def route(message):
+        if discover and message.get("cmd") == "follow_training_port":
+            status_details["auto_port"] = True
+            ports = status_details["evaluation_ports"] or status_details["training_ports"]
+            if ports and tap.port not in ports:
+                tap.set_port(ports[0])
+            reply = {"ok": True}
+        else:
+            reply = router(message)
+            if not (discover and message.get("cmd") == "set_port" and reply["ok"]):
+                return reply
+            status_details["auto_port"] = False
+        server.publish_json({**tap.status(), **status_details})
+        return reply
+
+    async def watch_ports():
+        while True:
+            try:
+                training, evaluating = await asyncio.to_thread(discover_training_ports, geometry.navrl_runs_root, args.airsim_host)
+            except (OSError, subprocess.SubprocessError) as exc:
+                logging.getLogger(__name__).warning("读取训练端口失败: %s", exc)
+            else:
+                if training != status_details["training_ports"] or evaluating != status_details["evaluation_ports"]:
+                    status_details.update(training_ports=training, evaluation_ports=evaluating)
+                    server.publish_json({**tap.status(), **status_details})
+                ports = evaluating or training
+                if status_details["auto_port"] and ports and tap.port not in ports:
+                    tap.set_port(ports[0])
+            await asyncio.sleep(3)
+
+    server.command_handler = route
     server.status_provider = lambda: {**tap.status(), **status_details, "color_mode": router.color_mode}
     server.on_clients_changed = tap.set_viewers
     server.initial_messages = lambda: [geometry.scene_message(),
@@ -145,7 +180,10 @@ async def serve(args: argparse.Namespace) -> None:
         if args.open or args.app:
             opener = open_ui(url, args.app)
             print(f"[uav_rviz] 已用 {opener} 打开" if opener else f"[uav_rviz] 请在浏览器打开 {url}", flush=True)
-        await asyncio.Event().wait()
+        if discover:
+            await watch_ports()
+        else:
+            await asyncio.Event().wait()
     finally:
         tap.stop()
         await server.stop()

@@ -205,6 +205,56 @@ def _goal_from_navrl_snapshot(path: Path, stage: int, rpc_port: int) -> Optional
     )
 
 
+def _evaluation_goal(launch_dir: Path, stage: int, port: Optional[int] = None) -> Optional[GoalMarker]:
+    round_dir = launch_dir.parent if launch_dir.name.startswith("attempt_") else launch_dir
+    if (round_dir / "result.json").exists():
+        return None
+    manifest = _read_json_object(round_dir / "scenario_manifest.json") or {}
+    cases = manifest.get("scenarios")
+    if not isinstance(cases, list) or not cases:
+        return None
+    if any(not isinstance(case, dict) or not isinstance(case.get("scenario_id"), str) for case in cases):
+        return None
+    active_path = round_dir / "active_scenario.json"
+    port_path = round_dir / f"active_scenario_{port}.json"
+    if port_path.exists():
+        active_path = port_path
+    radius = NAVRL_GOAL_RADIUS_M
+    if active_path.exists():
+        active = _read_json_object(active_path) or {}
+        current = active.get("scenario_id")
+        if not isinstance(current, str):
+            return None
+        configured = active.get("accept_radius_m")
+        if type(configured) in (int, float) and math.isfinite(configured) and configured > 0:
+            radius = configured
+        index = next((n for n, case in enumerate(cases) if case.get("scenario_id") == current), len(cases))
+    else:
+        # The running continuation evaluates the ordered manifest and commits each
+        # completed case before resetting to the next, including across RPC retries.
+        try:
+            done = json.loads((round_dir / "completed_cases.json").read_bytes())
+        except FileNotFoundError:
+            if launch_dir.name != "attempt_01":
+                return None
+            done = []
+        except (ValueError, OSError):
+            return None
+        if not isinstance(done, list) or len(done) > len(cases):
+            return None
+        if any(not isinstance(row, dict) or row.get("scenario_id") != case.get("scenario_id")
+               for row, case in zip(done, cases)):
+            return None
+        index = len(done)
+    if index >= len(cases):
+        return None
+    goal = cases[index].get("goal_position")
+    if not isinstance(goal, list) or len(goal) != 3 or not all(type(v) in (float, int) and math.isfinite(v) for v in goal):
+        return None
+    return GoalMarker(ned_to_enu_point(goal), (radius,) * 2, radius,
+                      source="navrl_evaluation", episode_hint=index + 1, stage=stage)
+
+
 def boxes_from_episode_record(record: dict[str, Any], floor_z: float = DEFAULT_FLOOR_Z) -> list[SceneBox]:
     """``temporary_obstacles``（NED y、局部 z-up 区间）→ ENU 盒子。"""
     boxes: list[SceneBox] = []
@@ -361,24 +411,27 @@ class GeometryLoader:
         for stage, path in sorted(candidates, reverse=True):
             if stage < minimum_stage:
                 break
-            manifest = _read_json_object(path / "launch.json")
-            if manifest is None:
-                continue
+            manifest = _read_json_object(path / "launch.json") or {}
             map_path = manifest.get("map")
             if isinstance(map_path, str) and map_path.startswith(_NAVRL_MAP_PREFIX):
                 self.is_navrl_run = True
             if rpc_port is None or not self.is_navrl_run:
                 continue
-            instances = manifest.get("instances")
-            if not isinstance(instances, list):
-                continue
-            instance = next((i for i in instances if isinstance(i, dict) and i.get("port") == rpc_port), None)
-            if instance is None:
-                continue
-            settings = instance.get("settings")
-            launch_id = settings.get("TrainEnvLaunchId") if isinstance(settings, dict) else None
-            self._navrl_stages[root, rpc_port] = stage
-            return stage, path, launch_id if isinstance(launch_id, str) and launch_id else None
+            def matching_launches():
+                yield path, manifest
+                for launch in sorted((path / "evaluations").glob("round_*/**/launch.json"), reverse=True):
+                    yield launch.parent, _read_json_object(launch) or {}
+
+            for launch_dir, launch_record in matching_launches():
+                instances = launch_record.get("instances")
+                if not isinstance(instances, list):
+                    continue
+                instance = next((i for i in instances if isinstance(i, dict) and i.get("port") == rpc_port), None)
+                if instance is not None:
+                    settings = instance.get("settings")
+                    launch_id = settings.get("TrainEnvLaunchId") if isinstance(settings, dict) else None
+                    self._navrl_stages[root, rpc_port] = stage
+                    return stage, launch_dir, launch_id if isinstance(launch_id, str) and launch_id else None
         return None
 
     def _find_latest_navrl_stage(self, runs_root: Path, rpc_port: Optional[int]) -> Optional[tuple[int, Path, Optional[str]]]:
@@ -414,7 +467,9 @@ class GeometryLoader:
             self.navrl_launch_id = active_stage[2] if active_stage is not None else None
             if active_stage is not None and rpc_port is not None and launch_id and launch_id == self.navrl_launch_id:
                 stage, path, _ = active_stage
-                if not (path / "decision.json").is_file():
+                if path.name.startswith(("round_", "attempt_")):
+                    new_goal = _evaluation_goal(path, stage, rpc_port)
+                elif not (path / "decision.json").is_file():
                     new_goal = _goal_from_navrl_snapshot(path / f"live_goal_{rpc_port}.json", stage, rpc_port)
             changed = not was_navrl or new_goal != self.goal
             self.goal = new_goal

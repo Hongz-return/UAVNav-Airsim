@@ -1,10 +1,16 @@
 """Evaluate a MA-SAC checkpoint on a dedicated NavRL forest simulator."""
 
 from configparser import ConfigParser
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from itertools import pairwise
+import json
+import logging
 import math
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Lock
+from zlib import crc32
 
 import numpy as np
 import torch
@@ -68,11 +74,13 @@ def _path_metrics(positions, crossing_axis, goal):
     }
 
 
-def _evaluate_scenario(model, gym_env, transpose, scenario, *, seed=None):
+def _evaluate_scenario(model, gym_env, transpose, scenario, *, seed=None, on_reset=None):
     scenario_id = scenario["scenario_id"]
     obs, info = gym_env.reset(seed=seed)
     if info["scenario_id"] != scenario_id:
         raise RuntimeError(f"AirSim reset to {info['scenario_id']!r}, expected {scenario_id!r}.")
+    if on_reset is not None:
+        on_reset(scenario_id)
 
     path = None
     if "crossing_axis" in scenario:
@@ -80,6 +88,9 @@ def _evaluate_scenario(model, gym_env, transpose, scenario, *, seed=None):
         # Use the settled position and avoid another trip to the simulator.
         reset_state = gym_env.unwrapped.dynamic_model.last_reset_state
         path = [tuple(reset_state["position_ned_m"][:2])]
+        goal_ned = scenario["goal_position"]
+        goal_up = (goal_ned[0], goal_ned[1], -goal_ned[2])
+        closest = math.dist(reset_state["position_ned_m"], goal_ned)
 
     episode_start = np.ones(1, dtype=bool)
     collision = False
@@ -94,6 +105,7 @@ def _evaluate_scenario(model, gym_env, transpose, scenario, *, seed=None):
         collision |= bool(info["is_crash"] or info.get("collision_event", False))
         if path is not None:
             path.append(tuple(info["position"][:2]))
+            closest = min(closest, math.dist(info["position"], goal_up))
         if terminated or truncated:
             break
     else:
@@ -120,11 +132,12 @@ def _evaluate_scenario(model, gym_env, transpose, scenario, *, seed=None):
     }
     if path is not None:
         outcome.update(_path_metrics(path, scenario["crossing_axis"], scenario["goal_position"]))
+        outcome["closest_goal_distance_m"] = closest
     return outcome
 
 
 def evaluate_checkpoint(
-    checkpoint: Path, cfg: ConfigParser, scenarios: list[dict], *, seed: int,
+    checkpoint: Path, cfg: ConfigParser, scenarios: list[dict], *, seed: int, on_outcome=None, ports=None,
 ) -> list[dict]:
     """Run the ordered cases once each against the dedicated RPC port in cfg."""
     checkpoint = Path(checkpoint)
@@ -141,26 +154,75 @@ def evaluate_checkpoint(
     if not scenario_ids or len(set(scenario_ids)) != len(scenario_ids):
         raise ValueError("Evaluation scenarios must have unique IDs and cannot be empty.")
 
-    eval_cfg = deepcopy(cfg)
+    ports = list(ports) if ports is not None else [port]
+    if not ports or len(set(ports)) != len(ports) or any(not 1 <= p <= 65535 for p in ports):
+        raise ValueError("Evaluation ports must be distinct valid RPC ports.")
+    work = Queue()
+    for index, scenario in enumerate(scenarios):
+        case_seed = seed if index == 0 else None
+        if len(ports) > 1:
+            case_seed = (seed + crc32(scenario["scenario_id"].encode())) % (2 ** 32)
+        work.put((scenario, case_seed))
+    outcomes = {}
+    save_lock = Lock()
+    model_lock = Lock()
+
+    def save(row):
+        with save_lock:
+            outcomes[row["scenario_id"]] = row
+            if on_outcome is not None:
+                on_outcome(row)
+
+    def fly(port_number):
+        eval_cfg = deepcopy(cfg)
+        eval_cfg.set("airsim", "rpc_port", str(port_number))
+        marker = "active_scenario" if len(ports) == 1 else f"active_scenario_{port_number}"
+        _fly_queue(checkpoint, eval_cfg, work, save, model_lock, marker, port_number)
+
+    if len(ports) == 1:
+        fly(ports[0])
+    else:
+        with ThreadPoolExecutor(max_workers=len(ports)) as pool:
+            list(pool.map(fly, ports))
+    return [outcomes[key] for key in scenario_ids]
+
+
+def _fly_queue(checkpoint, eval_cfg, work, save, model_lock, marker, port_number):
+    round_dir = checkpoint.parent
+    publish_goals = (round_dir / "scenario_manifest.json").is_file()
+    radius = eval_cfg.getfloat("environment", "accept_radius", fallback=0.5)
+    def publish(scenario_id):
+        if publish_goals:
+            try:
+                pending = round_dir / (marker + ".tmp")
+                pending.write_text(json.dumps({"scenario_id": scenario_id, "accept_radius_m": radius}), encoding="utf-8")
+                pending.replace(round_dir / (marker + ".json"))
+            except OSError as exc:
+                logging.getLogger(__name__).warning("Cannot publish evaluation goal: %s", exc)
+
     env = build_runtime_env(eval_cfg)
     # build_runtime_env returns VecTransposeImage(DummyVecEnv([monitored_env])).
     gym_env = env.venv.envs[0]
     try:
-        gym_env.unwrapped.set_evaluation_scenarios(scenarios)
         devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
         # Loading an independent policy constructs Torch modules. Preserve the
         # training RNG state across that initialization and the evaluation.
-        with torch.random.fork_rng(devices=devices):
+        with model_lock, torch.random.fork_rng(devices=devices):
             model = load_model("SAC", str(checkpoint), env, cfg=eval_cfg, load_replay=False)
             model.policy.set_training_mode(False)
-            return [
-                _evaluate_scenario(
-                    model, gym_env, env.transpose_observations, scenario,
-                    seed=seed if index == 0 else None,
-                )
-                for index, scenario in enumerate(scenarios)
-            ]
+        while True:
+            try:
+                scenario, case_seed = work.get_nowait()
+            except Empty:
+                break
+            publish(None)
+            gym_env.unwrapped.set_evaluation_scenarios([scenario])
+            row = _evaluate_scenario(model, gym_env, env.transpose_observations, scenario,
+                                     seed=case_seed, on_reset=publish)
+            row["evaluation_port"] = port_number
+            save(row)
     finally:
+        publish(None)
         try:
             env.close()
         finally:

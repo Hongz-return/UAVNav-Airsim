@@ -1,1 +1,0 @@
-"""Checkpoint selection entry points."""

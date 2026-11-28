@@ -20,10 +20,14 @@ const LAYER_SWITCHES = [
 ] as const satisfies ReadonlyArray<{ key: keyof Layers; label: string; color: string }>;
 
 function PortSelector({ port, store }: { port: number; store: LiveStore }) {
+  const status = useTopic(store, 'status', () => store.status);
+  const livePorts = status?.training_ports;
+  const evalPorts = status?.evaluation_ports ?? [];
+  const ports = livePorts ? [...livePorts, ...evalPorts] : PORTS;
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState('');
   const [invalid, setInvalid] = useState(false);
-  const preset = PORTS.includes(port);
+  const preset = ports.includes(port);
 
   function select(next: string) {
     if (next === 'custom') {
@@ -33,6 +37,10 @@ function PortSelector({ port, store }: { port: number; store: LiveStore }) {
       return;
     }
     setEditing(false);
+    if (next === 'auto') {
+      store.send({ cmd: 'follow_training_port' });
+      return;
+    }
     store.send({ cmd: 'set_port', port: Number(next) });
   }
 
@@ -51,9 +59,10 @@ function PortSelector({ port, store }: { port: number; store: LiveStore }) {
     <div className="port-control">
       <label className="port-label">
         <span>RPC 端口</span>
-        <select aria-label="AirSim RPC 端口" value={editing ? 'custom' : String(port)} onChange={(e) => select(e.target.value)}>
-          {PORTS.map((p) => <option key={p} value={p}>{p}</option>)}
-          {!preset && <option value={port}>{port}</option>}
+        <select aria-label="AirSim RPC 端口" value={editing ? 'custom' : status?.auto_port ? 'auto' : String(port)} onChange={(e) => select(e.target.value)}>
+          {livePorts && <option value="auto">自动 · {ports.includes(port) ? port : '等待训练'}{evalPorts.includes(port) ? ' · 评估' : ''}</option>}
+          {ports.map((p) => <option key={p} value={p}>{p}{livePorts && (evalPorts.includes(p) ? ' · 评估' : ' · 训练')}</option>)}
+          {!preset && !status?.auto_port && <option value={port}>{port}</option>}
           <option value="custom">自定义…</option>
         </select>
       </label>
@@ -124,7 +133,10 @@ function LayerPanel({ store }: { store: LiveStore }) {
         {scene?.goal?.source === 'navrl_live' && (
           <span>第 {scene.goal.stage} 档 · 第 {scene.goal.episode} 回合</span>
         )}
-        {scene?.navrl && !scene.goal && status?.connected && <span>等待训练发布随机终点</span>}
+        {scene?.goal?.source === 'navrl_evaluation' && (
+          <span>第 {scene.goal.stage} 档 · 评估路线 {scene.goal.episode}</span>
+        )}
+        {scene?.navrl && !scene.goal && status?.connected && <span>{status.evaluation_ports?.includes(status.port) ? '等待评估路线' : '等待训练发布随机终点'}</span>}
       </div>
     </aside>
   );

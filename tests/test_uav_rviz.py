@@ -591,6 +591,67 @@ class GeometryTests(unittest.TestCase):
 
 
 class NavRLGoalTests(unittest.TestCase):
+    def test_evaluation_only_stage_discovers_four_ports_and_their_separate_goals(self):
+        from tools.uav_rviz.training_ports import discover_training_ports
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._curriculum(Path(tmp) / "run")
+            stage = root / "stage_1"
+            rd = stage / "evaluations/round_001"
+            rd.mkdir(parents=True)
+            (stage / "route_phase.json").write_text('{"route_phase":"fixed"}')
+            ports = list(range(41815, 41819))
+            instances = [{"port": p, "pid": p, "settings": {"TrainEnvLaunchId": "eval"}} for p in ports]
+            (rd / "launch.json").write_text(json.dumps({"map": "/Game/Training/Maps/L_Train_NavRL_Forest_V3_Stage1",
+                                                        "instances": instances}))
+            cases = [{"scenario_id": str(p), "goal_position": [2, i, 0]} for i, p in enumerate(ports)]
+            (rd / "scenario_manifest.json").write_text(json.dumps({"scenarios": cases}))
+            loader = geometry_loader.GeometryLoader(None, navrl_runs_root=root.parent)
+            for i, p in enumerate(ports):
+                (rd / f"active_scenario_{p}.json").write_text(json.dumps({"scenario_id": str(p), "accept_radius_m": 1.5}))
+                loader.poll_run_dir(rpc_port=p, launch_id="eval")
+                self.assertEqual(loader.effective_goal().episode_hint, i + 1)
+            from unittest.mock import patch
+            with patch("tools.uav_rviz.training_ports._matches_remote", return_value=True):
+                self.assertEqual(discover_training_ports(root.parent, "simulation.test"), ([], ports))
+
+    def test_evaluation_goals_follow_confirmed_launch_and_ordered_cases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._curriculum(Path(tmp) / "run")
+            stage = self._launch(root, 1, 41811)
+            round_dir = stage / "evaluations/round_007"
+            attempt = round_dir / "attempt_01"
+            attempt.mkdir(parents=True)
+            launch = {"instances": [{"port": 41815, "settings": {"TrainEnvLaunchId": "eval"}}]}
+            (attempt / "launch.json").write_text(json.dumps(launch))
+            cases = [{"scenario_id": "a", "goal_position": [2, 1, -1]},
+                     {"scenario_id": "b", "goal_position": [46, -3, 0.4]}]
+            (round_dir / "scenario_manifest.json").write_text(json.dumps({"scenarios": cases}))
+            loader = geometry_loader.GeometryLoader(None, run_dir=root)
+            def goal(launch_id="eval"):
+                loader.poll_run_dir(rpc_port=41815, launch_id=launch_id)
+                return loader.effective_goal()
+            self.assertIsNone(goal("other"))
+            self.assertEqual(goal().episode_hint, 1)
+            progress = round_dir / "completed_cases.json"
+            progress.write_text(json.dumps([{"scenario_id": "a"}]))
+            self.assertEqual(goal().position, (46, 3, -0.4))
+            self.assertEqual(goal().source, "navrl_evaluation")
+            progress.write_text(json.dumps([{"scenario_id": "b"}]))
+            self.assertIsNone(goal())
+            active = round_dir / "active_scenario.json"
+            active.write_text(json.dumps({"scenario_id": "b"}))
+            self.assertEqual(goal().episode_hint, 2)
+            active.write_text(json.dumps({"scenario_id": None}))
+            self.assertIsNone(goal())
+            per_port = round_dir / "active_scenario_41815.json"
+            per_port.write_text(json.dumps({"scenario_id": "a", "accept_radius_m": 1.5}))
+            self.assertEqual(goal().episode_hint, 1)
+            self.assertEqual(goal().radii, (1.5, 1.5))
+            (round_dir / "result.json").write_text("{}")
+            active.write_text(json.dumps({"scenario_id": "b"}))
+            self.assertIsNone(goal())
+
     class SimulatedLaunch(SimulatedAirSim):
         def __init__(self, port: int, launch_id: str):
             super().__init__(warmup_frames=0)

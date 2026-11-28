@@ -1,13 +1,17 @@
 """Regression coverage for the checkpoint evaluated by the forest gate."""
 
 import json
+from configparser import ConfigParser
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+import torch
 from unittest.mock import Mock, call, patch
 
-from scripts.training.train_navrl_curriculum import ForestPromotion, launch_stage, load_protocol
+from scripts.training.train_navrl_curriculum import ForestPromotion, launch_stage, load_protocol, run_alternating_stage
+from tools.navrl_forest_runtime import fixed_forest_routes
 
 
 class _Model:
@@ -37,6 +41,16 @@ class ForestProtocolTests(unittest.TestCase):
             launch_stage(args, stage, [41811], Path("run"), Path("settings.json"))
         self.assertEqual(launch.call_args.kwargs["clock_speed"], 2.0)
         self.assertEqual(launch.call_args.kwargs["clock_type"], "SteppableClock")
+        self.assertEqual(launch.call_args.kwargs["editor_project"], Path("Forest.uproject"))
+
+    def test_stage_omits_editor_project_for_packaged_executable(self):
+        args = SimpleNamespace(ue_exe=Path("Ch4Tunnel.exe"), ue_project=Path("Forest.uproject"),
+                               startup_timeout=120, clock_speed=2.0)
+        stage = SimpleNamespace(map_path="/Game/Training/Maps/v3")
+        with patch("scripts.training.train_navrl_curriculum.launch_trainenv") as launch:
+            launch_stage(args, stage, [41811], Path("run"), Path("settings.json"))
+        self.assertIsNone(launch.call_args.kwargs["editor_project"])
+        self.assertIn("-NoVSync", launch.call_args.kwargs["unreal_args"])
 
     def test_default_loads_full_field_and_explicit_versions_resolve_older_maps(self):
         with TemporaryDirectory() as tmp:
@@ -59,6 +73,95 @@ class ForestProtocolTests(unittest.TestCase):
 
 
 class ForestPromotionTests(unittest.TestCase):
+    def test_parallel_eval_releases_training_worlds_and_resumes_full_state(self):
+        active = []
+        trained = []
+        assessed = []
+
+        @contextmanager
+        def launch(*args):
+            active.append("training")
+            try:
+                yield None
+            finally:
+                active.pop()
+
+        def train(args, cfg, run_dir, simulator_job):
+            self.assertEqual(active, ["training"])
+            self.assertTrue(args.restore_replay)
+            state = torch.load(args.resume, weights_only=False)
+            self.assertIn("replay_buffer", state)
+            state["num_timesteps"] += args.timesteps
+            trained.append(state["num_timesteps"])
+            (run_dir / "models").mkdir(parents=True)
+            torch.save(state, run_dir / "models/model_sb3.zip")
+
+        def evaluate(checkpoint, directory, cases):
+            self.assertFalse(active)
+            weights = torch.load(checkpoint, weights_only=False)
+            self.assertNotIn("replay_buffer", weights)
+            assessed.append(weights["num_timesteps"])
+            return [dict(scenario_id=c["scenario_id"], collision_free_success=False) for c in cases]
+
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            source = folder / "original.zip"
+            torch.save({"replay_buffer": {}, "num_timesteps": 100000}, source)
+            gate = self.callback(folder, evaluate)
+            gate.first_eval_step = 100000
+            cfg = ConfigParser()
+            cfg.add_section("environment")
+            with patch("scripts.training.train_navrl_curriculum.launch_stage", launch), \
+                 patch("scripts.training.train_navrl_curriculum.run_training", train):
+                spent, full = run_alternating_stage(None, gate.stage, folder, None, cfg,
+                    [1, 2], gate, SimpleNamespace(restore_replay=True), source, 20)
+            self.assertEqual(trained, [100010, 100020])
+            self.assertEqual(assessed, [100000, 100010, 100020])
+            self.assertEqual(spent, 20)
+            self.assertTrue(full.is_file())
+
+    def test_resume_evaluates_exact_checkpoint_before_next_training_step(self):
+        with TemporaryDirectory() as tmp:
+            def evaluate(checkpoint, directory, cases):
+                return [{"scenario_id": c["scenario_id"], "collision_free_success": False} for c in cases]
+
+            callback = self.callback(Path(tmp), evaluate)
+            callback.model.num_timesteps = 100000
+            callback.first_eval_step = 100000
+            callback._on_training_start()
+            self.assertEqual([row["num_timesteps"] for row in callback.rounds], [100000])
+            self.assertEqual(callback.next_evaluation, callback.interval)
+            callback.model.num_timesteps += callback.interval
+            callback._on_step()
+            self.assertEqual(len(callback.rounds), 2)
+
+    def test_switch_keeps_model_and_requires_two_new_random_passes(self):
+        def score(checkpoint, directory, cases):
+            return [{"scenario_id": row["scenario_id"], "collision_free_success": i < 40,
+                     "crossed_core": True, "core_path_fraction": 1.0} for i, row in enumerate(cases)]
+
+        with TemporaryDirectory() as tmp:
+            callback = self.callback(Path(tmp), score)
+            callback.rules["EPISODES_PER_ROUND"] = 50
+            callback.rules["decide"] = lambda stage, rows: {
+                "decision": "advance" if len(rows) >= 2 and
+                all(r["collision_free_successes"] >= 40 for r in rows[-2:]) else "stay"}
+            callback.fixed_routes = fixed_forest_routes((22, (-12, 0, 12), .75))
+            workers = Mock()
+            callback.model.get_env = lambda: workers
+            for step in (110, 120, 130, 140):
+                callback.model.num_timesteps = step
+                self.assertEqual(callback._on_step(), step != 140)
+            workers.env_method.assert_called_once_with("enable_random_forest_routes")
+            rounds = sorted((Path(tmp) / "evaluations").iterdir())
+            results = [json.loads((p / "result.json").read_text()) for p in rounds]
+            self.assertEqual([r["decision"] for r in results], ["stay", "switch_to_random", "stay", "advance"])
+            self.assertEqual([r["route_phase"] for r in results], ["fixed", "fixed", "random", "random"])
+            cases = json.loads((rounds[0] / "scenario_manifest.json").read_text())["scenarios"]
+            routes = [(tuple(c["start_position"]), tuple(c["goal_position"])) for c in cases]
+            self.assertEqual(len(set(routes)), 18)
+            self.assertLessEqual(max(map(routes.count, routes)) - min(map(routes.count, routes)), 1)
+
     def callback(self, folder, evaluate):
         callback = ForestPromotion(
             SimpleNamespace(number=1), {"evaluation_scenarios": _scenarios, "decide": _gate},

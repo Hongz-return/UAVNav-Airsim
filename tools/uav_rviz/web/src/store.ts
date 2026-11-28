@@ -38,6 +38,9 @@ export interface StatusMsg {
   connected: boolean;
   airsim_host?: string;
   port: number;
+  auto_port?: boolean;
+  training_ports?: number[];
+  evaluation_ports?: number[];
   mode: Mode;
   mode_label: string;
   hz_target: number;
@@ -195,7 +198,7 @@ export class LiveStore {
 
   setConn(ws: ConnState['ws'], attempts?: number): void {
     this.conn = { ws, attempts: attempts ?? this.conn.attempts };
-    if (ws === 'closed' && this.scene?.goal?.source === 'navrl_live') {
+    if (ws === 'closed' && (this.scene?.goal?.source === 'navrl_live' || this.scene?.goal?.source === 'navrl_evaluation')) {
       this.setScene({ ...this.scene, goal: null });
     }
     this.emit('conn');

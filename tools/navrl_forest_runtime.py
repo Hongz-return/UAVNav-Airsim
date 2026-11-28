@@ -26,6 +26,28 @@ def parse_route_portals(value):
     return edge, tuple(offsets), jitter
 
 
+def fixed_forest_routes(route_portals):
+    edge, offsets, _ = route_portals
+    return [((EDGE_M - edge, first, 0.0), (EDGE_M + edge, last, 0.0))
+            for first in offsets for last in offsets]
+
+
+def fixed_evaluation_cases(routes, round_id, count):
+    cases = []
+    for index in range(count):
+        sequence = (round_id - 1) * count + index
+        start, goal = routes[sequence % len(routes)]
+        if sequence % 2:
+            start, goal = goal, start
+        cases.append({
+            "scenario_id": f"forest_fixed_round_{round_id}_episode_{index + 1:03d}",
+            "start_position": start, "goal_position": goal,
+            "yaw_rad": math.atan2(goal[1] - start[1], goal[0] - start[0]),
+            "crossing_axis": 0,
+        })
+    return {"scenarios": cases}
+
+
 def sample_training_route(rng, route_portals=None):
     """Return seeded AirSim NED endpoints and initial yaw for one episode."""
     points = []
@@ -50,7 +72,7 @@ def sample_training_route(rng, route_portals=None):
     return start, goal, math.atan2(goal[1] - start[1], goal[0] - start[0])
 
 
-def forest_config(base, stage, *, route_portals=None, synchronous_steps=True):
+def forest_config(base, stage, *, route_portals=None, synchronous_steps=True, accept_radius=0.5):
     """Apply the open-arena geometry without changing the MA-SAC policy contract."""
     if (base.get("options", "algo") != "SAC" or base.get("options", "perception") != "depth_state"
             or not base.getboolean("options", "use_mamba")
@@ -68,10 +90,28 @@ def forest_config(base, stage, *, route_portals=None, synchronous_steps=True):
             "start_position": [EDGE_M - route_edge, 0.0, 0.0],
             "goal_position": [EDGE_M + route_edge, 0.0, 0.0],
             "start_random_angle": 0.0,
+            "distance_norm_scale": 60.0,
+            "max_episode_steps": 500,
             "work_space_x": [EDGE_M - ARENA_HALF_SIZE_M, EDGE_M + ARENA_HALF_SIZE_M],
             "work_space_y": [-ARENA_HALF_SIZE_M, ARENA_HALF_SIZE_M],
             "work_space_z": [-1.3, 2.5],
-            "accept_radius": 0.5,
+            "accept_radius": accept_radius,
+        },
+        "reward": {
+            "progress_mode": "meters",
+            "progress_scale": 0.6,
+            "reward_reach": 40.0,
+            "reward_crash": -25.0,
+            "reward_outside": -25.0,
+            "reward_timeout": -25.0,
+            "obstacle_safe_margin": 1.8,
+            "obstacle_penalty_weight": 1.2,
+            "time_penalty": 0.03,
+            "action_smoothness_weight": 0.06,
+            "altitude_deviation_weight": 0.15,
+        },
+        "DRL": {
+            "min_ent_coef": 0.02,
         },
         "perception": {"virtual_ceiling_prob": 0.0},
         "airsim": {
@@ -80,7 +120,7 @@ def forest_config(base, stage, *, route_portals=None, synchronous_steps=True):
             "synchronous_steps": synchronous_steps,
             "depth_only": True,
             "cache_step_state": True,
-            "timeout_value": base.getfloat("airsim", "timeout_value", fallback=15.0),
+            "timeout_value": base.getfloat("airsim", "timeout_value", fallback=45.0),
         },
         "navrl_forest": {
             "stage": stage.number,

@@ -427,7 +427,8 @@ export class ViewportEngine {
     g.fillStyle = '#6ee7b7';
     g.textAlign = 'center';
     g.textBaseline = 'middle';
-    g.fillText(goal.source === 'navrl_live' ? '随机终点' : 'GOAL 终点', 128, 37);
+    const label = goal.source === 'navrl_evaluation' ? '评估终点' : goal.source === 'navrl_live' ? '随机终点' : 'GOAL 终点';
+    g.fillText(label, 128, 37);
     const badgeTex = new THREE.CanvasTexture(badge);
     const badgeSprite = new THREE.Sprite(
       new THREE.SpriteMaterial({ map: badgeTex, transparent: true, depthTest: false, depthWrite: false, fog: false }),
