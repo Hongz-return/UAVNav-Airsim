@@ -3,7 +3,7 @@
 关键保证
 --------
 1. **100% 只读**：所有 RPC 都经过 :class:`ReadOnlyClient` 白名单代理，仅允许
-   ``ping / getMultirotorState / simGetVehiclePose / simGetCollisionInfo / simGetImages /
+   ``ping / getSettingsString / getMultirotorState / simGetVehiclePose / simGetImages /
    simListSceneObjects / simGetObjectPose / simGetObjectScale``。``enableApiControl / armDisarm /
    simPause / reset / moveByVelocity*`` 等任何写接口都会在客户端侧直接抛 :class:`ReadOnlyViolation`，
    根本不会发往仿真器。
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import json
 import logging
 import math
 import random
@@ -62,9 +63,9 @@ LOG = logging.getLogger("uav_rviz.tap")
 READ_ONLY_METHODS = frozenset(
     {
         "ping",
+        "getSettingsString",
         "getMultirotorState",
         "simGetVehiclePose",
-        "simGetCollisionInfo",
         "simGetImages",
         "simListSceneObjects",
         "simGetObjectPose",
@@ -344,6 +345,8 @@ class AirSimTap:
         self.consecutive_failures = 0
 
         self._client: Optional[ReadOnlyClient] = None
+        self._expected_navrl_launch_id: Optional[str] = None
+        self._reported_navrl_launch_id: Optional[str] = None
         self._seq = 0
         self._viewers = 0
         self._last_pos: Optional[tuple[float, float, float]] = None
@@ -449,12 +452,30 @@ class AirSimTap:
         self._last_pos = None
         self._last_sim_ts = None
         self.geometry.attach(client)
+        self._reported_navrl_launch_id = None
+        self.geometry.poll_run_dir(rpc_port=self.port)
+        self._expected_navrl_launch_id = self.geometry.navrl_launch_id
+        if self._expected_navrl_launch_id is not None:
+            self._reported_navrl_launch_id = self._read_navrl_launch_id(client)
+            self._poll_run_dir()
         self.geometry.scan_live()
-        self.geometry.poll_run_dir()
         self._emit_scene()
         self._set_state("connected")
         LOG.info("已连接 AirSim %s:%s (%s)", self.host, self.port, self.profile.name)
         return True
+
+    def _read_navrl_launch_id(self, client: ReadOnlyClient) -> Optional[str]:
+        try:
+            settings = json.loads(client.getSettingsString())
+        except Exception:
+            return None  # Settings are optional for pose telemetry.
+        if not isinstance(settings, dict) or settings.get("ApiServerPort") != self.port:
+            return None
+        launch_id = settings.get("TrainEnvLaunchId")
+        return launch_id if isinstance(launch_id, str) and launch_id else None
+
+    def _poll_run_dir(self) -> bool:
+        return self.geometry.poll_run_dir(rpc_port=self.port, launch_id=self._reported_navrl_launch_id)
 
     def _on_connect_failed(self, error: str) -> None:
         self._schedule_reconnect(error)
@@ -470,6 +491,9 @@ class AirSimTap:
         client, self._client = self._client, None
         if client is not None:
             client.close()
+            if self.geometry.is_navrl_run:
+                self.geometry.attach(None)
+                self._emit_scene()
 
     def _emit_scene(self) -> None:
         if self.on_scene:
@@ -509,7 +533,7 @@ class AirSimTap:
             self._emit_status()
         if pending.get("refresh_scene") and self._client is not None:
             self.geometry.force_rescan()
-            self.geometry.poll_run_dir()
+            self._poll_run_dir()
             self._emit_scene()
 
     # -- 主循环 --------------------------------------------------------------
@@ -562,6 +586,16 @@ class AirSimTap:
         self._wake.clear()
 
     def _tick(self, now: float) -> None:
+        poll_interval = 0.5 if self.geometry.is_navrl_run else 2.0
+        if now - self._last_run_poll >= poll_interval:
+            self._last_run_poll = now
+            scene_changed = self._poll_run_dir()
+            launch_id = self.geometry.navrl_launch_id
+            if launch_id is not None and launch_id != self._expected_navrl_launch_id:
+                self._schedule_reconnect("NavRL 训练实例已切换")
+                return
+            if scene_changed:
+                self._emit_scene()
         try:
             result = self.step()
         except Exception as exc:
@@ -581,21 +615,12 @@ class AirSimTap:
             LOG.info("旁路自适应退避 degraded=%s hz=%.1f", self.governor.degraded, self.governor.hz)
             self._emit_status()
         reset = bool(result.meta.get("reset"))
-        if self.geometry.client is not None and (reset or now - self.geometry.last_scan_time > self.profile.scene_scan_s):
+        scan = self.geometry.client is not None and (reset or now - self.geometry.last_scan_time > self.profile.scene_scan_s)
+        if scan:
             self.geometry.scan_live()
-            self.geometry.update_live_pose(
-                tuple(result.meta["pos"]), tuple(result.meta["vel"]),
-            )
+        goal_changed = self.geometry.update_live_pose(tuple(result.meta["pos"]), tuple(result.meta["vel"]))
+        if scan or goal_changed:
             self._emit_scene()
-        else:
-            pos = tuple(result.meta["pos"])
-            vel = tuple(result.meta["vel"])
-            if self.geometry.update_live_pose(pos, vel):
-                self._emit_scene()
-            elif now - self._last_run_poll > 2.0:
-                self._last_run_poll = now
-                if self.geometry.poll_run_dir():
-                    self._emit_scene()
 
     # -- 单次采样 ------------------------------------------------------------
     def _api_module(self) -> Any:
@@ -622,7 +647,8 @@ class AirSimTap:
 
         pose = timed("pose", client.simGetVehiclePose)
         state = timed("state", client.getMultirotorState)
-        collision = timed("collision", client.simGetCollisionInfo)
+        # CosysAirSim's simGetCollisionInfo consumes the flag used by the training task.
+        collision = getattr(state, "collision", None)
         want_rgb = prof.name == "direct" and self.rgb_enabled
         requests = [api.ImageRequest(self.camera, api.ImageType.DepthPlanar, True, False)]
         if want_rgb:
@@ -701,8 +727,10 @@ class AirSimTap:
 
         # --- 碰撞 / 目标误差 ---
         col_ts = int(getattr(collision, "time_stamp", 0) or 0)
-        new_collision = bool(collision.has_collided) and col_ts != self._last_collision_ts
-        self._last_collision_ts = col_ts if collision.has_collided else self._last_collision_ts
+        has_collided = bool(getattr(collision, "has_collided", False))
+        new_collision = has_collided and col_ts != self._last_collision_ts
+        if has_collided:
+            self._last_collision_ts = col_ts
         goal = self.geometry.effective_goal()
         goal_err = None
         if goal is not None:
@@ -740,7 +768,8 @@ class AirSimTap:
             "speed": _num(speed),
             "camera": {"pos": _vec(cam_pos_enu), "quat": _vec(cam_q_enu, 6)},
             "collision": {
-                "has_collided": bool(collision.has_collided),
+                "available": has_collided or col_ts > 0,
+                "has_collided": has_collided,
                 "new": new_collision,
                 "object": str(getattr(collision, "object_name", "") or ""),
                 "ts": col_ts,

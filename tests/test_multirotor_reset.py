@@ -1,4 +1,6 @@
 """Reset must report controller failures before an episode starts."""
+from configparser import ConfigParser
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -17,6 +19,7 @@ class MultirotorResetTest(unittest.TestCase):
         dynamics.client.simGetCollisionInfo.return_value = SimpleNamespace(has_collided=False)
         dynamics._owns_client = True
         dynamics.synchronous_steps = False
+        dynamics._forest_reset = False
         dynamics.vehicle_name = 'SimpleFlight'
         dynamics.start_fixed_yaw = 0.0
         dynamics.start_random_angle = 0.0
@@ -67,6 +70,34 @@ class MultirotorResetTest(unittest.TestCase):
         dynamics.client.simPause.assert_called_with(True)
         dynamics.client.cancelLastTask.assert_called_once_with('SimpleFlight')
 
+    def test_navrl_clock_speed_scales_wall_windows_only(self):
+        for forest, speed, expected in ((True, 2, (.05, .02)), (True, 1, (.1, .04)),
+                                        (True, None, (.1, .04)), (False, 2, (.1, .04))):
+            with self.subTest(forest=forest, speed=speed):
+                cfg = ConfigParser()
+                cfg.read_dict({
+                    'options': {'navigation_3d': True, 'using_velocity_state': False},
+                    'multirotor': {'dt': .1, 'v_xy_max': 2, 'v_xy_min': 0, 'v_z_max': 1, 'yaw_rate_max_deg': 90},
+                    'airsim': {'synchronous_steps': True},
+                })
+                if forest:
+                    cfg.add_section('navrl_forest')
+                client = Mock()
+                settings = {'ClockType': 'SteppableClock'}
+                if speed is not None:
+                    settings['ClockSpeed'] = speed
+                client.getSettingsString.return_value = json.dumps(settings)
+                client.getMultirotorState.side_effect = [
+                    SimpleNamespace(timestamp=t) for t in (0, 60_000_000, 102_000_000)
+                ]
+                dynamics = MultirotorDynamicsAirsim(cfg, client=client)
+                dynamics._advance_synchronously(1, 0, 0, airsim.YawMode())
+                client.getSettingsString.assert_called_once_with()
+                self.assertAlmostEqual(dynamics.last_control_sim_seconds, .102)
+                self.assertEqual(client.simContinueForTime.call_count, len(expected))
+                for call, window in zip(client.simContinueForTime.call_args_list, expected):
+                    self.assertAlmostEqual(call.args[0], window)
+
     def test_synchronous_rpc_error_still_propagates_after_physics_is_paused(self):
         dynamics = self.make_dynamics()
         dynamics.dt = 0.1
@@ -90,6 +121,22 @@ class MultirotorResetTest(unittest.TestCase):
         self.assertEqual(list(state.linear_velocity), [0, 0, 0])
         self.assertEqual(list(state.angular_velocity), [0, 0, 0])
         self.assertTrue(dynamics._advance_synchronously.call_args.args[3].is_rate)
+
+    def test_continuous_forest_settles_the_pawn_then_runs_freely(self):
+        dynamics = self.make_dynamics()
+        dynamics._forest_reset = True
+        dynamics._advance_synchronously = Mock()
+        dynamics._validate_reset_state = Mock()
+        dynamics.reset()
+        dynamics.client.simSetObjectPose.assert_called_once()
+        dynamics.client.simSetKinematics.assert_called_once()
+        dynamics._validate_reset_state.assert_called_once_with(0.0)
+        dynamics.client.simPause.assert_called_with(False)
+
+        dynamics._validate_reset_state.side_effect = RuntimeError('invalid spawn')
+        with self.assertRaisesRegex(RuntimeError, 'invalid spawn'):
+            dynamics.reset()
+        dynamics.client.simPause.assert_called_with(True)
 
     def test_invalid_reset_is_rejected_before_an_episode_can_start(self):
         dynamics = self.make_dynamics()

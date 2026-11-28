@@ -1,6 +1,7 @@
 """
 Mamba-SAC: SAC with Sequence Replay Buffer for proper temporal learning.
 """
+import math
 import numpy as np
 import random
 import torch
@@ -47,6 +48,7 @@ class MambaSAC(BaseAlgorithm):
         gradient_steps: int = 1,
         ent_coef: Union[str, float] = "auto",
         target_entropy: Union[str, float] = "auto",
+        min_ent_coef: float = 0.0,
         tensorboard_log: Optional[str] = None,
         policy_kwargs: Optional[Dict[str, Any]] = None,
         verbose: int = 0,
@@ -96,6 +98,9 @@ class MambaSAC(BaseAlgorithm):
         
         self.ent_coef_init = ent_coef
         self.target_entropy_init = target_entropy
+        if not math.isfinite(min_ent_coef) or min_ent_coef < 0.0:
+            raise ValueError("min_ent_coef must be finite and non-negative")
+        self.min_ent_coef = float(min_ent_coef)
         self.demo_action_anchor = None
         self.demo_terminal_altitude_weight = 0.0
         self.demo_terminal_precision_weight = 0.0
@@ -135,8 +140,9 @@ class MambaSAC(BaseAlgorithm):
             self.target_entropy = float(self.target_entropy_init)
         
         if self.ent_coef_init == "auto":
-            # Initialize to 0.1 (log(0.1) ~= -2.3) for reasonable exploration
-            init_value = torch.log(torch.tensor([0.1], device=self.device))
+            # Initialize to 0.1 (or min_ent_coef if larger) for reasonable exploration
+            init_ent = max(0.1, self.min_ent_coef)
+            init_value = torch.log(torch.tensor([init_ent], device=self.device))
             self.log_ent_coef = init_value.clone().requires_grad_(True)
             self.ent_coef_optimizer = torch.optim.Adam([self.log_ent_coef], lr=self.lr_schedule(1))
         else:
@@ -455,6 +461,9 @@ class MambaSAC(BaseAlgorithm):
             self.ent_coef_optimizer.zero_grad()
             ent_coef_loss.backward()
             self.ent_coef_optimizer.step()
+            if self.min_ent_coef > 0.0:
+                with torch.no_grad():
+                    self.log_ent_coef.clamp_(min=math.log(self.min_ent_coef))
 
         # ========== Target Network Update ==========
         # critic_target owns target_cnn, so its parameters are updated here too.
@@ -750,6 +759,7 @@ class MambaSAC(BaseAlgorithm):
             'seq_len': self.seq_len,
             'batch_size': self.batch_size,
             'critic_loss': self.critic_loss,
+            'min_ent_coef': self.min_ent_coef,
         }
         
         # Optionally save replay buffer (for true checkpoint resume)
@@ -838,6 +848,7 @@ class MambaSAC(BaseAlgorithm):
             checkpoint = torch.load(path, map_location="cpu")
         
         kwargs.setdefault('critic_loss', checkpoint.get('critic_loss', 'huber'))
+        kwargs.setdefault('min_ent_coef', checkpoint.get('min_ent_coef', 0.0))
         for setting in ("failure_horizon", "failure_rewards"):
             if setting in checkpoint:
                 kwargs.setdefault(setting, checkpoint[setting])
@@ -864,6 +875,8 @@ class MambaSAC(BaseAlgorithm):
         if checkpoint.get('log_ent_coef') is not None and model.log_ent_coef is not None:
             saved_log_ent_coef = checkpoint['log_ent_coef'].detach().to(model.device)
             model.log_ent_coef.data.copy_(saved_log_ent_coef)
+            if model.min_ent_coef > 0.0:
+                model.log_ent_coef.data.clamp_(min=math.log(model.min_ent_coef))
         if checkpoint.get('ent_coef_optimizer_state') is not None and model.log_ent_coef is not None:
             model.ent_coef_optimizer.load_state_dict(checkpoint['ent_coef_optimizer_state'])
             model._move_optimizer_state_to_device(model.ent_coef_optimizer, model.device)

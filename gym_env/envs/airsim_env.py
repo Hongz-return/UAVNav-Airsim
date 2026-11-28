@@ -3,6 +3,11 @@ AirSim Gym environment for UAV navigation.
 """
 
 import ast
+from contextlib import suppress
+import json
+import logging
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 import time
 
 import gymnasium as gym
@@ -12,6 +17,9 @@ from gymnasium import spaces
 from .dynamics.multirotor_airsim import MultirotorDynamicsAirsim, step_state_reads
 from .perception import get_perception
 from .tasks import get_task
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class AirsimGymEnv(gym.Env):
@@ -29,6 +37,9 @@ class AirsimGymEnv(gym.Env):
         self.perception = None
         self.training_routes = []
         self.stage3_course = None
+        self.navrl_forest = False
+        self._navrl_route_portals = None
+        self._navrl_goal_path = None
         self.print_airsim_log = False
         # Evaluation-only switch: keep episodes alive after collision events
         # and let the evaluator aggregate collision statistics separately.
@@ -43,6 +54,12 @@ class AirsimGymEnv(gym.Env):
         self.env_name = cfg.get("options", "env_name")
         self.dynamic_name = cfg.get("options", "dynamic_name")
         self.perception_type = cfg.get("options", "perception")
+        self.navrl_forest = cfg.has_section("navrl_forest")
+        self._navrl_route_portals = None
+        if self.navrl_forest and cfg.has_option("navrl_forest", "route_portals"):
+            from tools.navrl_forest_runtime import parse_route_portals
+
+            self._navrl_route_portals = parse_route_portals(cfg.get("navrl_forest", "route_portals"))
         self.print_airsim_log = cfg.getboolean("options", "print_airsim_log", fallback=False)
         reward_type = cfg.get("options", "reward_type", fallback="reward_final")
         use_pid_residual = cfg.getboolean("options", "use_pid_residual", fallback=False)
@@ -63,6 +80,15 @@ class AirsimGymEnv(gym.Env):
         self.client = self.dynamic_model.client
         self.state_feature_length = self.dynamic_model.state_feature_length
         self.action_space = self.dynamic_model.action_space
+
+        self._navrl_goal_path = None
+        goal_dir = cfg.get("navrl_forest", "goal_dir", fallback=None)
+        if self.navrl_forest and goal_dir is not None:
+            self._navrl_goal_stage = cfg.getint("navrl_forest", "stage")
+            if not goal_dir.strip() or self._navrl_goal_stage < 1:
+                raise ValueError("NavRL live goals require a non-empty goal_dir and a positive stage")
+            self._navrl_goal_path = Path(goal_dir) / f"live_goal_{self.dynamic_model.airsim_port}.json"
+            self._navrl_goal_write_warned = False
 
         self._load_environment_config(cfg)
 
@@ -135,14 +161,34 @@ class AirsimGymEnv(gym.Env):
             parsed.append((start, goal))
         return parsed
 
+    def enable_random_forest_routes(self):
+        """Switch the next episode reset to the existing forest portal sampler."""
+        self.training_routes = []
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
         self._apply_next_evaluation_scenario()
         route_idx = None
         route_reversed = False
+        live_goal_ned = None
         if self.stage3_course is not None and self._evaluation_scenarios is None:
             self.stage3_course.select_route(self)
+        elif self.navrl_forest and self._evaluation_scenarios is None:
+            from tools.navrl_forest_runtime import sample_training_route
+
+            if self.training_routes:
+                route_idx = int(self.np_random.integers(len(self.training_routes)))
+                start, goal = self.training_routes[route_idx]
+                route_reversed = bool(self.random_route_reverse and self.np_random.integers(2))
+                if route_reversed:
+                    start, goal = goal, start
+                yaw = np.arctan2(goal[1] - start[1], goal[0] - start[0])
+            else:
+                start, goal, yaw = sample_training_route(self.np_random, self._navrl_route_portals)
+            self.dynamic_model.set_start(start, random_angle=0.0, fixed_yaw=yaw)
+            self.dynamic_model._set_goal_pose_single(goal)
+            live_goal_ned = goal
         elif self._evaluation_scenarios is None and self.training_routes:
             route_idx = int(self.np_random.integers(len(self.training_routes)))
             start, goal = self.training_routes[route_idx]
@@ -152,6 +198,11 @@ class AirsimGymEnv(gym.Env):
                     start, goal = goal, start
             self.dynamic_model.set_start(start, random_angle=self.start_random_angle, fixed_yaw=None)
             self.dynamic_model._set_goal_pose_single(goal)
+        if self._navrl_goal_path is not None and live_goal_ned is not None:
+            try:
+                self._navrl_goal_path.unlink(missing_ok=True)
+            except OSError as error:
+                self._warn_navrl_goal_write(error)
         self.dynamic_model.reset(rng=self.np_random)
         self.episode_num += 1
         self.step_num = 0
@@ -163,7 +214,7 @@ class AirsimGymEnv(gym.Env):
         if self.task:
             self.task.reset()
 
-        disable_augmentation = self._evaluation_scenarios is not None or (
+        disable_augmentation = self.navrl_forest or self._evaluation_scenarios is not None or (
             self.stage3_course is not None and self.stage3_course.disable_virtual_ceiling
         )
         self.perception.reset(rng=self.np_random, disable_augmentation=disable_augmentation)
@@ -172,6 +223,8 @@ class AirsimGymEnv(gym.Env):
             self.dynamic_model.get_velocity()
             self.episode_start_state_timestamp = self.dynamic_model.last_state_timestamp
             self.episode_start_wall_time = time.perf_counter()
+        if self._navrl_goal_path is not None and live_goal_ned is not None:
+            self._publish_navrl_goal(live_goal_ned)
         return obs, {
             "scenario_id": (
                 self.current_scenario.get("scenario_id")
@@ -181,6 +234,35 @@ class AirsimGymEnv(gym.Env):
             "route_index": route_idx,
             "route_reversed": route_reversed,
         }
+
+    def _publish_navrl_goal(self, goal_ned):
+        x, y, z = goal_ned
+        payload = json.dumps({
+            "stage": self._navrl_goal_stage,
+            "rpc_port": self.dynamic_model.airsim_port,
+            "episode": self.episode_num,
+            "goal_position": [float(x), float(y), float(z)],
+            "published_at": time.time(),
+        }, allow_nan=False)
+        temporary = None
+        try:
+            with NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self._navrl_goal_path.parent,
+                prefix=f".{self._navrl_goal_path.name}.", suffix=".tmp", delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(payload + "\n")
+            temporary.replace(self._navrl_goal_path)
+        except OSError as error:
+            if temporary is not None:
+                with suppress(OSError):
+                    temporary.unlink(missing_ok=True)
+            self._warn_navrl_goal_write(error)
+
+    def _warn_navrl_goal_write(self, error):
+        if not self._navrl_goal_write_warned:
+            _LOGGER.warning("Could not update NavRL live goal %s: %s", self._navrl_goal_path, error)
+            self._navrl_goal_write_warned = True
 
     def set_evaluation_scenarios(self, scenarios):
         """Install an ordered, reproducible evaluation scenario sequence."""
@@ -204,6 +286,10 @@ class AirsimGymEnv(gym.Env):
         self.dynamic_model.set_start(start_position, random_angle=0.0, fixed_yaw=yaw_rad)
         self.dynamic_model._set_goal_pose_single(goal_position)
         self.current_scenario = scenario
+
+    def pause_for_evaluation(self, paused):
+        """Hold a continuous training world while its independent evaluation runs."""
+        self.client.simPause(paused)
 
     def _execute_action(self, action):
         """Execute the policy action directly."""

@@ -164,17 +164,15 @@ class SimulatedAirSim:
     def getMultirotorState(self, *_a: Any, **_k: Any) -> SimpleNamespace:
         self.calls.append("getMultirotorState")
         self._lag()
-        t, pos, vel, q_enu, _ = self._kin()
+        t, pos, vel, q_enu, collided = self._kin()
         pose = self._ned_pose(pos, q_enu)
         kin = SimpleNamespace(position=pose.position, orientation=pose.orientation,
                               linear_velocity=_v3(float(vel[0]), float(-vel[1]), float(-vel[2])))
-        return SimpleNamespace(timestamp=int((t + 1.0) * 1e9), kinematics_estimated=kin)
-
-    def simGetCollisionInfo(self, *_a: Any) -> SimpleNamespace:
-        self.calls.append("simGetCollisionInfo")
-        _, _, _, _, collided = self._kin()
-        return SimpleNamespace(has_collided=collided, object_name="Ch4Stage3V2_1_goal_end_wall" if collided else "",
-                               time_stamp=self._collision_ts * 1_000_000)
+        collision = SimpleNamespace(
+            has_collided=collided, object_name="Ch4Stage3V2_1_goal_end_wall" if collided else "",
+            time_stamp=max(1, self._collision_ts * 1_000_000),
+        )
+        return SimpleNamespace(timestamp=int((t + 1.0) * 1e9), kinematics_estimated=kin, collision=collision)
 
     def _lag(self) -> None:
         if self.latency_s > 0:

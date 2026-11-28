@@ -38,6 +38,9 @@ export interface StatusMsg {
   connected: boolean;
   airsim_host?: string;
   port: number;
+  auto_port?: boolean;
+  training_ports?: number[];
+  evaluation_ports?: number[];
   mode: Mode;
   mode_label: string;
   hz_target: number;
@@ -70,7 +73,16 @@ export interface SceneMsg {
   roof_z: number | null;
   boxes: SceneBox[];
   box_source: string;
-  goal: { p: [number, number, number]; radii: [number, number]; alt_tol: number; source: string; family: string | null } | null;
+  navrl?: boolean;
+  goal: {
+    p: [number, number, number];
+    radii: [number, number];
+    alt_tol: number;
+    source: string;
+    family: string | null;
+    stage?: number;
+    episode?: number;
+  } | null;
   scan_error: string | null;
 }
 
@@ -186,6 +198,9 @@ export class LiveStore {
 
   setConn(ws: ConnState['ws'], attempts?: number): void {
     this.conn = { ws, attempts: attempts ?? this.conn.attempts };
+    if (ws === 'closed' && (this.scene?.goal?.source === 'navrl_live' || this.scene?.goal?.source === 'navrl_evaluation')) {
+      this.setScene({ ...this.scene, goal: null });
+    }
     this.emit('conn');
   }
 

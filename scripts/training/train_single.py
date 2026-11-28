@@ -105,7 +105,7 @@ def main(argv=None):
     run_training(args, cfg)
 
 
-def run_training(args, cfg, run_dir=None, simulator_job=None):
+def run_training(args, cfg, run_dir=None, simulator_job=None, *, extra_callbacks=()):
     env_name = cfg.get('options', 'env_name')
     algo = cfg.get('options', 'algo')
     dynamic_name = cfg.get('options', 'dynamic_name')
@@ -182,7 +182,7 @@ def run_training(args, cfg, run_dir=None, simulator_job=None):
                 resume_details = {
                     "resume_checkpoint": os.path.abspath(checkpoint_path),
                     "resume_checkpoint_sha256": digest,
-                    "resume_replay": False,
+                    "resume_replay": bool(getattr(args, "restore_replay", False)),
                 }
             with open(os.path.join(log_dir, 'run.json'), 'w', encoding='utf-8') as f:
                 json.dump(
@@ -246,6 +246,7 @@ def run_training(args, cfg, run_dir=None, simulator_job=None):
         )
 
         callbacks = [checkpoint_callback, uav_logging_callback, best_model_callback]
+        callbacks.extend(extra_callbacks)
         if stage3 or stage3_v2:
             from tools.ue_benchmark.ch4_stage3_training import Stage3CourseMetrics
 

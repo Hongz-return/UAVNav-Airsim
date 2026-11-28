@@ -63,7 +63,7 @@ def trainenv_settings(template, *, show_viewport=False):
 
 
 def trainenv_command(executable, settings_path, log_path, map_path=TRAINENV_MAP, editor_project=None, *,
-                     show_viewport=False):
+                     show_viewport=False, unreal_args=()):
     target = [str(executable), map_path]
     if editor_project is not None:
         target = [str(executable), str(editor_project), map_path, "-game", "-DisablePlugins=FunplayMCP"]
@@ -74,6 +74,7 @@ def trainenv_command(executable, settings_path, log_path, map_path=TRAINENV_MAP,
         *target, "-windowed", "-ResX=160", "-ResY=120",
         "-NoSound", "-unattended", "-nosplash", f"-settings={settings_path}",
         f"-AbsLog={log_path}", "-ExecCmds=" + ",".join(render_commands),
+        *unreal_args,
     ]
 
 
@@ -219,6 +220,7 @@ def _wait_ready(processes, launch_id, timeout):
 def launch_trainenv(
     *, executable, template, ports, start_position, clock_speed, run_dir, timeout, map_path=TRAINENV_MAP,
     editor_project=None, show_viewport=False, clock_type=None,
+    unreal_args=(),
 ):
     """Launch TrainEnv instances and bind their lifetime to the caller."""
     if not executable.is_file():
@@ -250,7 +252,7 @@ def launch_trainenv(
                     )
                     log_path = run_dir / f"ue_{port}.log"
                     command = trainenv_command(runtime_exe, instance_settings, log_path, map_path, editor_project,
-                                               show_viewport=show_viewport)
+                                               show_viewport=show_viewport, unreal_args=unreal_args)
                     process = subprocess.Popen(command, cwd=runtime_exe.parent, creationflags=subprocess.CREATE_NO_WINDOW)
                     try:
                         job.add(process)

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import random
 import re
 import tempfile
@@ -16,6 +17,7 @@ import unittest
 from collections import Counter
 from pathlib import Path
 from unittest.mock import patch
+from uuid import NAMESPACE_URL, uuid5
 
 import numpy as np
 
@@ -394,7 +396,7 @@ class ReadOnlyGuardTests(unittest.TestCase):
     FORBIDDEN = ("enableApiControl", "armDisarm", "simPause", "reset", "moveByVelocityAsync",
                  "moveByVelocityZAsync", "moveByVelocityBodyFrameAsync", "takeoffAsync", "landAsync",
                  "simSetVehiclePose", "simSpawnObject", "simDestroyObject", "simContinueForTime", "hoverAsync",
-                 "simSetObjectPose", "simSetCameraPose", "simRunConsoleCommand")
+                 "simSetObjectPose", "simSetCameraPose", "simRunConsoleCommand", "simGetCollisionInfo")
 
     def test_every_write_api_blocked_before_reaching_simulator(self):
         sim = SimulatedAirSim()
@@ -419,6 +421,7 @@ class ReadOnlyGuardTests(unittest.TestCase):
         issued = set(sim.calls)
         self.assertTrue(issued <= READ_ONLY_METHODS, issued - READ_ONLY_METHODS)
         self.assertIn("simGetImages", issued)
+        self.assertNotIn("getSettingsString", issued)
         self.assertEqual(set(tap._client.calls) - READ_ONLY_METHODS, set())
 
     def test_bypass_only_requests_depth_even_when_rgb_is_requested(self):
@@ -585,6 +588,262 @@ class GeometryTests(unittest.TestCase):
             time.sleep(0.05)
             (runs / "b" / "course_episodes.jsonl").write_text("{}\n", encoding="utf-8")
             self.assertEqual(geometry_loader.resolve_run_dir("auto", root=Path(tmp)), runs / "b")
+
+
+class NavRLGoalTests(unittest.TestCase):
+    def test_evaluation_only_stage_discovers_four_ports_and_their_separate_goals(self):
+        from tools.uav_rviz.training_ports import discover_training_ports
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._curriculum(Path(tmp) / "run")
+            stage = root / "stage_1"
+            rd = stage / "evaluations/round_001"
+            rd.mkdir(parents=True)
+            (stage / "route_phase.json").write_text('{"route_phase":"fixed"}')
+            ports = list(range(41815, 41819))
+            instances = [{"port": p, "pid": p, "settings": {"TrainEnvLaunchId": "eval"}} for p in ports]
+            (rd / "launch.json").write_text(json.dumps({"map": "/Game/Training/Maps/L_Train_NavRL_Forest_V3_Stage1",
+                                                        "instances": instances}))
+            cases = [{"scenario_id": str(p), "goal_position": [2, i, 0]} for i, p in enumerate(ports)]
+            (rd / "scenario_manifest.json").write_text(json.dumps({"scenarios": cases}))
+            loader = geometry_loader.GeometryLoader(None, navrl_runs_root=root.parent)
+            for i, p in enumerate(ports):
+                (rd / f"active_scenario_{p}.json").write_text(json.dumps({"scenario_id": str(p), "accept_radius_m": 1.5}))
+                loader.poll_run_dir(rpc_port=p, launch_id="eval")
+                self.assertEqual(loader.effective_goal().episode_hint, i + 1)
+            from unittest.mock import patch
+            with patch("tools.uav_rviz.training_ports._matches_remote", return_value=True):
+                self.assertEqual(discover_training_ports(root.parent, "simulation.test"), ([], ports))
+
+    def test_evaluation_goals_follow_confirmed_launch_and_ordered_cases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._curriculum(Path(tmp) / "run")
+            stage = self._launch(root, 1, 41811)
+            round_dir = stage / "evaluations/round_007"
+            attempt = round_dir / "attempt_01"
+            attempt.mkdir(parents=True)
+            launch = {"instances": [{"port": 41815, "settings": {"TrainEnvLaunchId": "eval"}}]}
+            (attempt / "launch.json").write_text(json.dumps(launch))
+            cases = [{"scenario_id": "a", "goal_position": [2, 1, -1]},
+                     {"scenario_id": "b", "goal_position": [46, -3, 0.4]}]
+            (round_dir / "scenario_manifest.json").write_text(json.dumps({"scenarios": cases}))
+            loader = geometry_loader.GeometryLoader(None, run_dir=root)
+            def goal(launch_id="eval"):
+                loader.poll_run_dir(rpc_port=41815, launch_id=launch_id)
+                return loader.effective_goal()
+            self.assertIsNone(goal("other"))
+            self.assertEqual(goal().episode_hint, 1)
+            progress = round_dir / "completed_cases.json"
+            progress.write_text(json.dumps([{"scenario_id": "a"}]))
+            self.assertEqual(goal().position, (46, 3, -0.4))
+            self.assertEqual(goal().source, "navrl_evaluation")
+            progress.write_text(json.dumps([{"scenario_id": "b"}]))
+            self.assertIsNone(goal())
+            active = round_dir / "active_scenario.json"
+            active.write_text(json.dumps({"scenario_id": "b"}))
+            self.assertEqual(goal().episode_hint, 2)
+            active.write_text(json.dumps({"scenario_id": None}))
+            self.assertIsNone(goal())
+            per_port = round_dir / "active_scenario_41815.json"
+            per_port.write_text(json.dumps({"scenario_id": "a", "accept_radius_m": 1.5}))
+            self.assertEqual(goal().episode_hint, 1)
+            self.assertEqual(goal().radii, (1.5, 1.5))
+            (round_dir / "result.json").write_text("{}")
+            active.write_text(json.dumps({"scenario_id": "b"}))
+            self.assertIsNone(goal())
+
+    class SimulatedLaunch(SimulatedAirSim):
+        def __init__(self, port: int, launch_id: str):
+            super().__init__(warmup_frames=0)
+            self.settings = {"ApiServerPort": port, "TrainEnvLaunchId": launch_id}
+
+        def getSettingsString(self) -> str:
+            return json.dumps(self.settings)
+
+    @staticmethod
+    def _curriculum(root: Path, timestamp: int = 1) -> Path:
+        root.mkdir(parents=True)
+        marker = root / "curriculum.json"
+        marker.write_text("{}", encoding="utf-8")
+        os.utime(marker, (timestamp, timestamp))
+        return root
+
+    @staticmethod
+    def _launch_id(directory: Path) -> str:
+        return uuid5(NAMESPACE_URL, directory.as_posix()).hex
+
+    def _launch(self, root: Path, stage: int, *ports: int) -> Path:
+        directory = root / f"stage_{stage}"
+        directory.mkdir(parents=True, exist_ok=True)
+        launch_id = self._launch_id(directory)
+        manifest = {
+            "map": f"/Game/Training/Maps/L_Train_NavRL_Forest_Stage{stage}",
+            "instances": [
+                {"port": port, "settings": {"ApiServerPort": port, "TrainEnvLaunchId": launch_id}}
+                for port in ports
+            ],
+        }
+        (directory / "launch.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return directory
+
+    def _poll(self, loader: geometry_loader.GeometryLoader, launch: Path) -> bool:
+        return loader.poll_run_dir(rpc_port=41811, launch_id=self._launch_id(launch))
+
+    @staticmethod
+    def _publish(directory: Path, port: int, **fields) -> None:
+        snapshot = {"stage": int(directory.name.split("_")[-1]), "rpc_port": port,
+                    "episode": 1, "goal_position": [42, 7, -0.75], "published_at": 1, **fields}
+        (directory / f"live_goal_{port}.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    def test_exact_snapshot_for_explicit_stage_and_no_tunnel_guess(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = self._launch(Path(tmp), 1, 41811, 41812)
+            (stage / "course_episodes.jsonl").write_text('{"goal_position":[0,0,0]}\n', encoding="utf-8")
+            loader = geometry_loader.GeometryLoader(run_dir=stage)
+            self._publish(stage, 41812)
+            self.assertTrue(self._poll(loader, stage))
+            self.assertTrue(loader.scene_message()["navrl"])
+            self.assertIsNone(loader.effective_goal())
+            with patch.object(geometry_loader, "infer_live_goal") as infer:
+                loader.update_live_pose((0, 0, 0))
+                infer.assert_not_called()
+            self._publish(stage, 41811, rpc_port=41812)
+            self.assertFalse(self._poll(loader, stage))
+            self._publish(stage, 41811, episode=3)
+            self.assertTrue(self._poll(loader, stage))
+            goal = loader.scene_message()["goal"]
+            self.assertEqual(goal, {"p": [42.0, -7.0, 0.75], "radii": [0.5, 0.5], "alt_tol": 0.5,
+                                    "source": "navrl_live", "family": None, "stage": 1, "episode": 3})
+            self._publish(stage, 41811, episode=4, stage=2)
+            self.assertTrue(self._poll(loader, stage))
+            self.assertIsNone(loader.effective_goal())
+
+    def test_stage_directory_follows_curriculum_for_its_port(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self._curriculum(Path(tmp) / "run")
+            stage1 = self._launch(run, 1, 41811)
+            self._publish(stage1, 41811)
+            loader = geometry_loader.GeometryLoader(run_dir=stage1)
+            self.assertTrue(self._poll(loader, stage1))
+            self._launch(run, 2, 41812)
+            self.assertFalse(self._poll(loader, stage1))
+            stage2 = self._launch(run, 2, 41811, 41812)
+            self.assertTrue(self._poll(loader, stage1))
+            self.assertIsNone(loader.effective_goal())
+            self._publish(stage2, 41811, goal_position=[16, -24, 0.1])
+            self.assertFalse(self._poll(loader, stage1))
+            self.assertTrue(self._poll(loader, stage2))
+            self.assertEqual(loader.scene_message()["goal"]["stage"], 2)
+            self.assertEqual(loader.effective_goal().position, (16, 24, -0.1))
+            (stage2 / "launch.json").unlink()
+            self.assertTrue(self._poll(loader, stage2))
+            self.assertIsNone(loader.effective_goal())
+
+    def test_follow_navrl_selects_new_run_for_port_and_clears_completed_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp)
+            stage1 = self._launch(self._curriculum(runs / "first", 1), 1, 41811)
+            self._publish(stage1, 41811)
+            unrelated = self._launch(self._curriculum(runs / "second", 2), 1, 41812)
+            self._publish(unrelated, 41812)
+            loader = geometry_loader.GeometryLoader(navrl_runs_root=runs, infer_goals=False)
+            self.assertTrue(self._poll(loader, stage1))
+            self.assertEqual(loader.scene_message()["goal"]["p"], [42.0, -7.0, 0.75])
+            new_stage = self._launch(self._curriculum(runs / "third", 3), 1, 41811)
+            self.assertTrue(self._poll(loader, stage1))
+            self.assertIsNone(loader.effective_goal())
+            self._publish(new_stage, 41811, goal_position=[16, 24, 1])
+            self.assertTrue(self._poll(loader, new_stage))
+            self.assertEqual(loader.scene_message()["goal"]["p"], [16.0, -24.0, -1.0])
+            (new_stage / "decision.json").write_text("{}", encoding="utf-8")
+            self.assertTrue(self._poll(loader, new_stage))
+            self.assertIsNone(loader.effective_goal())
+            (new_stage / "launch.json").unlink()
+            self.assertFalse(self._poll(loader, new_stage))
+            self.assertIsNone(loader.effective_goal())
+
+    def test_tap_polls_new_episode_and_clears_marker_on_port_switch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self._curriculum(Path(tmp) / "run")
+            stage = self._launch(run, 1, 41811, 41812)
+            self._publish(stage, 41811)
+            messages, frames = [], []
+            loader = geometry_loader.GeometryLoader(run_dir=run, infer_goals=False)
+            factory = lambda _host, port, _timeout: self.SimulatedLaunch(port, self._launch_id(stage))
+            tap = AirSimTap(port=41811, client_factory=factory, api=SIM_API,
+                            geometry=loader, on_scene=messages.append, on_telemetry=frames.append)
+            try:
+                self.assertTrue(tap._connect())
+                self.assertEqual(messages[-1]["goal"]["episode"], 1)
+                self._publish(stage, 41811, episode=2, goal_position=[14, -24, 2])
+                tap._tick(0.5)
+                self.assertEqual(messages[-1]["goal"]["episode"], 2)
+                self.assertIsNotNone(protocol.decode_telemetry(frames[-1]).meta["goal_err"])
+                tap.set_port(41812)
+                tap._apply_pending()
+                self.assertIsNone(messages[-1]["goal"])
+                self.assertTrue(tap._connect())
+                self.assertIsNone(messages[-1]["goal"])
+                self._publish(stage, 41812)
+                tap._tick(1.0)
+                self.assertEqual(messages[-1]["goal"]["episode"], 1)
+                tap._schedule_reconnect("simulated disconnect")
+                self.assertIsNone(messages[-1]["goal"])
+                loader.set_manual_goal((1, 2, 3))
+                self.assertTrue(tap._connect())
+                self.assertEqual(messages[-1]["goal"]["source"], "manual")
+            finally:
+                tap._close_client()
+
+    def test_same_port_other_launch_has_telemetry_and_no_stale_goal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self._curriculum(Path(tmp) / "run")
+            stage = self._launch(run, 1, 41811)
+            self._publish(stage, 41811)
+            messages, frames = [], []
+            loader = geometry_loader.GeometryLoader(run_dir=run)
+            factory = lambda _host, port, _timeout: self.SimulatedLaunch(port, "other-launch")
+            tap = AirSimTap(port=41811, client_factory=factory, api=SIM_API, geometry=loader,
+                            on_scene=messages.append, on_telemetry=frames.append)
+            try:
+                self.assertTrue(tap._connect())
+                self.assertTrue(messages[-1]["navrl"])
+                self.assertIsNone(messages[-1]["goal"])
+                tap._tick(0.5)
+                tap._tick(1.0)
+                self.assertEqual(tap.state, "connected")
+                self.assertEqual(tap.status()["rpc_calls"]["getSettingsString"], 1)
+                self.assertTrue(frames)
+                self.assertIsNone(protocol.decode_telemetry(frames[-1]).meta["goal_err"])
+                self.assertIsNone(messages[-1]["goal"])
+            finally:
+                tap._close_client()
+
+    def test_tap_verifies_new_stage_once_at_reconnect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self._curriculum(Path(tmp) / "run")
+            active_stage = self._launch(run, 1, 41811)
+            self._publish(active_stage, 41811)
+            messages = []
+            loader = geometry_loader.GeometryLoader(run_dir=run)
+            factory = lambda _host, port, _timeout: self.SimulatedLaunch(port, self._launch_id(active_stage))
+            tap = AirSimTap(port=41811, client_factory=factory, api=SIM_API,
+                            geometry=loader, on_scene=messages.append)
+            try:
+                self.assertTrue(tap._connect())
+                self.assertEqual(messages[-1]["goal"]["stage"], 1)
+                active_stage = self._launch(run, 2, 41811)
+                self._publish(active_stage, 41811)
+                tap._tick(0.5)
+                self.assertEqual(tap.state, "reconnecting")
+                self.assertIsNone(messages[-1]["goal"])
+                self.assertTrue(tap._connect())
+                self.assertEqual(messages[-1]["goal"]["stage"], 2)
+                tap._tick(1.0)
+                self.assertEqual(tap.state, "connected")
+                self.assertEqual(tap.status()["rpc_calls"]["getSettingsString"], 1)
+            finally:
+                tap._close_client()
 
 
 class CommandRouterTests(unittest.TestCase):

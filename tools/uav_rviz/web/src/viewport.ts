@@ -315,6 +315,9 @@ export class ViewportEngine {
     this.gridGroup.position.z = this.floorZ + 0.002;
     this.disposeGroup(this.obstacleGroup);
     this.disposeGroup(this.goalGroup);
+    this.goalPos = null;
+    this.goalLine = null;
+    this.goalLineGeom = null;
     this.roofMaterials = [];
     if (!scene) return;
     this.rebuildObstacles(scene);
@@ -364,14 +367,11 @@ export class ViewportEngine {
 
   private rebuildGoal(scene: SceneMsg): void {
     const goal = scene.goal;
-    this.goalPos = null;
-    this.goalLine = null;
-    this.goalLineGeom = null;
     if (!goal) return;
     const [gx, gy, gz] = goal.p;
     this.goalPos = new THREE.Vector3(gx, gy, gz);
     const colors = [0x34d399, 0x5eead4];
-    goal.radii.forEach((r, i) => {
+    [...new Set(goal.radii)].forEach((r, i) => {
       const pts: THREE.Vector3[] = [];
       for (let k = 0; k <= 96; k++) {
         const a = (k / 96) * Math.PI * 2;
@@ -411,7 +411,7 @@ export class ViewportEngine {
     );
     core.position.set(gx, gy, gz);
 
-    // 醒目标签：GOAL 终点（无视雾化，高空可见）
+    // 世界空间里的终点标签。
     const badge = document.createElement('canvas');
     badge.width = 256;
     badge.height = 72;
@@ -427,7 +427,8 @@ export class ViewportEngine {
     g.fillStyle = '#6ee7b7';
     g.textAlign = 'center';
     g.textBaseline = 'middle';
-    g.fillText('GOAL 终点', 128, 37);
+    const label = goal.source === 'navrl_evaluation' ? '评估终点' : goal.source === 'navrl_live' ? '随机终点' : 'GOAL 终点';
+    g.fillText(label, 128, 37);
     const badgeTex = new THREE.CanvasTexture(badge);
     const badgeSprite = new THREE.Sprite(
       new THREE.SpriteMaterial({ map: badgeTex, transparent: true, depthTest: false, depthWrite: false, fog: false }),
@@ -441,12 +442,14 @@ export class ViewportEngine {
       new THREE.Vector3(gx, gy, gz),
       new THREE.Vector3(gx, gy, gz),
     ]);
+    this.goalLineGeom.setAttribute('lineDistance', new THREE.Float32BufferAttribute([0, 0], 1));
     this.goalLine = new THREE.Line(
       this.goalLineGeom,
       new THREE.LineDashedMaterial({
         color: 0x34d399, dashSize: 1.5, gapSize: 0.9, transparent: true, opacity: 0.65, fog: false,
       }),
     );
+    this.goalLine.frustumCulled = false;
     this.goalLine.visible = false;
     this.goalGroup.add(pole, core, badgeSprite, this.goalLine);
   }
@@ -582,9 +585,10 @@ export class ViewportEngine {
       if (this.goalLine && this.goalLineGeom && this.goalPos) {
         const attr = this.goalLineGeom.getAttribute('position') as THREE.BufferAttribute;
         attr.setXYZ(0, this.curPos.x, this.curPos.y, this.curPos.z);
-        attr.setXYZ(1, this.goalPos.x, this.goalPos.y, this.goalPos.z);
         attr.needsUpdate = true;
-        this.goalLine.computeLineDistances();
+        const distance = this.goalLineGeom.getAttribute('lineDistance') as THREE.BufferAttribute;
+        distance.setX(1, this.curPos.distanceTo(this.goalPos));
+        distance.needsUpdate = true;
         this.goalLine.visible = this.layers.goal;
       }
 

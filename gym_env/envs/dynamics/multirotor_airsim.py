@@ -70,12 +70,16 @@ class MultirotorDynamicsAirsim:
             raise ValueError("environment.max_vertical_difference must be finite and positive")
         self.align_start_yaw_to_goal = cfg.getboolean('environment', 'align_start_yaw_to_goal', fallback=False)
         self.dt = cfg.getfloat('multirotor', 'dt')
-        self.vehicle_name = vehicle_name or cfg.get('airsim', 'vehicle_name', fallback='')
+        self._forest_reset = cfg.has_section('navrl_forest')
+        default_vehicle = 'SimpleFlight' if self._forest_reset else ''
+        self.vehicle_name = vehicle_name or cfg.get('airsim', 'vehicle_name', fallback=default_vehicle)
         self.airsim_ip = cfg.get('airsim', 'ip', fallback='')
         self.airsim_port = cfg.getint('airsim', 'rpc_port', fallback=41451)
         self.airsim_timeout = cfg.getfloat('airsim', 'timeout_value', fallback=3600.0)
         self.synchronous_steps = cfg.getboolean('airsim', 'synchronous_steps', fallback=False)
         self.cache_step_state = cfg.getboolean('airsim', 'cache_step_state', fallback=False)
+        if self._forest_reset and not self.vehicle_name:
+            raise ValueError('NavRL forest requires a named UE vehicle')
 
         # AirSim client (shared if provided, else create new)
         if client is not None:
@@ -90,10 +94,15 @@ class MultirotorDynamicsAirsim:
             self.client.confirmConnection()
             self._owns_client = True
 
-        if self.synchronous_steps:
+        if self.synchronous_steps or self._forest_reset:
             settings = json.loads(self.client.getSettingsString())
             if settings.get('ClockType') != 'SteppableClock':
-                raise ValueError('synchronous_steps requires AirSim ClockType=SteppableClock')
+                raise ValueError('Stepped control and NavRL airborne resets require AirSim ClockType=SteppableClock')
+            if self._forest_reset:
+                clock_speed = settings.get('ClockSpeed', 1.0)
+                if type(clock_speed) not in (int, float) or clock_speed not in (1, 2):
+                    raise ValueError('NavRL forest requires AirSim ClockSpeed=1 or 2')
+                self._navrl_clock_speed = clock_speed
 
         self.client.enableApiControl(True, self.vehicle_name)
         self.client.armDisarm(True, self.vehicle_name)
@@ -133,13 +142,17 @@ class MultirotorDynamicsAirsim:
 
     def reset(self, rng=None):
         """Reset drone to start position and take off."""
-        if self.synchronous_steps:
-            self.client.simPause(True)
+        if not (self.synchronous_steps or self._forest_reset):
+            return self._reset_vehicle(rng)
+        self.client.simPause(True)
         try:
             self._reset_vehicle(rng)
-        finally:
-            if self.synchronous_steps:
-                self.client.simPause(True)
+        except BaseException:
+            self.client.simPause(True)
+            raise
+        # The forest always settles and validates the spawn while paused.
+        # Continuous collection then leaves physics running between actions.
+        self.client.simPause(self.synchronous_steps)
 
     def _reset_vehicle(self, rng):
         # Only reset all if we own the client (single vehicle mode)
@@ -164,12 +177,19 @@ class MultirotorDynamicsAirsim:
                 else 0.0
             )
             yaw = base_yaw + self.start_random_angle * (2.0 * random_source.random() - 1.0)
-        if self.synchronous_steps:
+        if self.synchronous_steps or self._forest_reset:
             state = airsim.KinematicsState()
             state.position = airsim.Vector3r(*self.start_position)
             state.orientation = to_quaternion(0, 0, yaw)
             state.linear_velocity = state.angular_velocity = airsim.Vector3r()
             state.linear_acceleration = state.angular_acceleration = airsim.Vector3r()
+            if getattr(self, '_forest_reset', False):
+                # Teleport the rendered pawn before assigning the AirSim physics pose.
+                self.client.simPause(True)
+                self.client.simGetCollisionInfo(self.vehicle_name)
+                pose = airsim.Pose(state.position, state.orientation)
+                if not self.client.simSetObjectPose(self.vehicle_name, pose):
+                    raise RuntimeError(f'Could not move the UE pawn for AirSim vehicle {self.vehicle_name!r}')
             self.client.simSetKinematics(state, True, self.vehicle_name)
             self._advance_synchronously(0, 0, 0, airsim.YawMode(True, 0), duration=1.0)
             self._validate_reset_state(yaw)
@@ -250,6 +270,7 @@ class MultirotorDynamicsAirsim:
         )
         advanced = 0.0
         minimum_window = 0.002
+        clock_speed = getattr(self, '_navrl_clock_speed', 1.0)
         scene_step = getattr(self, 'scene_step_callback', None)
         last_progress = time.monotonic()
         try:
@@ -260,7 +281,8 @@ class MultirotorDynamicsAirsim:
                 window = control_duration - advanced
                 if scene_step is not None:
                     window = min(window, 0.05)
-                self.client.simContinueForTime(max(minimum_window, window))
+                # AirSim uses a wall-clock window here. Keep the NavRL action budget in simulation time.
+                self.client.simContinueForTime(max(minimum_window, window) / clock_speed)
                 timestamp = self.client.getMultirotorState(vehicle_name=self.vehicle_name).timestamp
                 advanced = (timestamp - before) / 1e9
                 if scene_step is not None:
